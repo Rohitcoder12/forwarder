@@ -54,7 +54,8 @@ client = TelegramClient(SESSION_NAME, int(API_ID), API_HASH)
 @client.on(events.NewMessage())
 async def handle_new_message(event):
     """Listens for new messages and forwards them based on tasks in the database."""
-    print(f"DEBUG: New message received from chat ID: {event.chat_id}") # <-- ADD THIS LINE
+    # Uncomment the line below for future debugging if needed.
+    # print(f"DEBUG: New message received from chat ID: {event.chat_id}")
     chat_id = event.chat_id
     
     conn = sqlite3.connect(DB_FILE)
@@ -69,7 +70,6 @@ async def handle_new_message(event):
     message = event.message
     
     for destination_id, only_replies in tasks:
-        # Apply the 'only_replies' filter if it's enabled for the task
         if only_replies and not message.is_reply:
             print(f"Skipping message {message.id} from {chat_id}: not a reply.")
             continue
@@ -77,11 +77,15 @@ async def handle_new_message(event):
         print(f"Forwarding message {message.id} from {chat_id} to {destination_id}")
         
         try:
-            # Using send_message with file attribute handles most cases, including restricted content.
-            # This downloads the media and re-uploads it instead of using Telegram's forward function.
+            # **THE FIX IS HERE:**
+            # We explicitly send the message text and media file instead of the whole message object.
+            # This creates a new, clean message and avoids potential metadata/permission conflicts
+            # even when you are the owner of the channel.
             await client.send_message(
-                destination_id,
-                message
+                entity=destination_id,
+                message=message.text,
+                file=message.media,
+                reply_to=message.reply_to_msg_id if message.is_reply else None
             )
         except Exception as e:
             print(f"Could not forward message {message.id}. Error: {e}")
@@ -249,10 +253,7 @@ def cancel(update: Update, context: CallbackContext) -> int:
 
 async def main():
     """Main function to set up and run both the bot and the client."""
-    # Initialize the database
     init_db()
-
-    # Configure and run the python-telegram-bot
     updater = Updater(BOT_TOKEN)
     dp = updater.dispatcher
 
@@ -278,12 +279,9 @@ async def main():
     dp.add_handler(conv_handler)
     dp.add_handler(delete_handler)
     
-    # Start the bot polling in the background
     updater.start_polling()
     print("Control Bot started...")
 
-    # Start the Telethon client
-    # It will prompt for your phone number, password, and 2FA code on the first run
     await client.start()
     print("Telethon client (user account) started...")
     await client.run_until_disconnected()
