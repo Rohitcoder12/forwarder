@@ -67,10 +67,8 @@ async def handle_new_message(event):
         return
 
     for task in tasks:
-        # Unpack task data from the database row
         _, _, destination_id, blacklist, whitelist, block_photos, block_videos, block_documents, block_text = task
 
-        # --- NEW: Media Type Filtering ---
         if (block_photos and message.photo) or \
            (block_videos and message.video) or \
            (block_documents and message.document and not message.video and not message.photo) or \
@@ -78,25 +76,20 @@ async def handle_new_message(event):
             print(f"Skipping message {message.id}: Media type is blocked by task settings.")
             continue
 
-        # --- NEW: Robust Whitelist/Blacklist Logic ---
         full_text = (message.text or "").lower()
         mentions = []
         if message.entities:
             for entity in message.entities:
                 if isinstance(entity, MessageEntityMention):
-                    # Extract mention text like '@username'
                     mention_text = message.text[entity.offset : entity.offset + entity.length].lower()
                     mentions.append(mention_text)
 
-        # Whitelist Check
         if whitelist:
             whitelist_words = [word.strip().lower() for word in whitelist.split(',')]
-            # Check if any whitelist word is in the text OR if any whitelisted @mention matches
             if not any(word in full_text for word in whitelist_words) and not any(mention in mentions for mention in whitelist_words):
                 print(f"Skipping message {message.id}: No whitelist criteria met.")
                 continue
 
-        # Blacklist Check
         if blacklist:
             blacklist_words = [word.strip().lower() for word in blacklist.split(',')]
             if any(word in full_text for word in blacklist_words) or any(mention in mentions for mention in blacklist_words):
@@ -130,15 +123,14 @@ async def handle_new_message(event):
 
 SOURCE, DESTINATION, BLACKLIST, WHITELIST, MEDIA_FILTER, CONFIRMATION = range(6)
 
-# Helper functions for the new UI
 def build_media_filter_menu(context: CallbackContext):
     ud = context.user_data['media_filters']
     keyboard = [
-        [InlineKeyboardButton(f"{'✅' if not ud['photos'] else '🚫'} Block Photos", callback_data='toggle_photos')],
-        [InlineKeyboardButton(f"{'✅' if not ud['videos'] else '🚫'} Block Videos", callback_data='toggle_videos')],
-        [InlineKeyboardButton(f"{'✅' if not ud['documents'] else '🚫'} Block Documents/Files", callback_data='toggle_documents')],
-        [InlineKeyboardButton(f"{'✅' if not ud['text'] else '🚫'} Block Text-Only", callback_data='toggle_text')],
-        [InlineKeyboardButton("➡️ Done ➡️", callback_data='done_media_filter')]
+        [InlineKeyboardButton(f"{'✅ FORWARD' if not ud['photos'] else '🚫 BLOCK'} Photos", callback_data='toggle_photos')],
+        [InlineKeyboardButton(f"{'✅ FORWARD' if not ud['videos'] else '🚫 BLOCK'} Videos", callback_data='toggle_videos')],
+        [InlineKeyboardButton(f"{'✅ FORWARD' if not ud['documents'] else '🚫 BLOCK'} Files", callback_data='toggle_documents')],
+        [InlineKeyboardButton(f"{'✅ FORWARD' if not ud['text'] else '🚫 BLOCK'} Text", callback_data='toggle_text')],
+        [InlineKeyboardButton("➡️ Done With Filters ➡️", callback_data='done_media_filter')]
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -146,41 +138,35 @@ def start(update: Update, context: CallbackContext) -> None:
     update.message.reply_text("Welcome! Use /newtask to set up forwarding, /tasks to view, and /delete to remove.")
 
 def new_task_start(update: Update, context: CallbackContext) -> int:
-    # Initialize filters at the start
     context.user_data['media_filters'] = {'photos': False, 'videos': False, 'documents': False, 'text': False}
     update.message.reply_text("Let's set up a new task. First, define the Source chat.")
     return SOURCE
 
-# ... get_source and get_destination are mostly unchanged ...
-def get_source(update: Update, context: CallbackContext) -> int:
-    # ... (code is the same as before) ...
+def get_chat_id(update, context):
     if update.message.forward_from_chat:
-        context.user_data['source_id'] = update.message.forward_from_chat.id
-        context.user_data['source_title'] = update.message.forward_from_chat.title
+        context.user_data['chat_id'] = update.message.forward_from_chat.id
+        context.user_data['chat_title'] = update.message.forward_from_chat.title or "N/A"
     elif update.message.forward_from:
-        context.user_data['source_id'] = update.message.forward_from.id
-        context.user_data['source_title'] = update.message.forward_from.first_name
+        context.user_data['chat_id'] = update.message.forward_from.id
+        context.user_data['chat_title'] = update.message.forward_from.first_name
     else:
         try:
-            context.user_data['source_id'] = int(update.message.text)
-            context.user_data['source_title'] = f"ID: {update.message.text}"
-        except: return SOURCE
+            context.user_data['chat_id'] = int(update.message.text)
+            context.user_data['chat_title'] = f"ID: {update.message.text}"
+        except: return None
+    return True
+
+def get_source(update: Update, context: CallbackContext) -> int:
+    if not get_chat_id(update, context): return SOURCE
+    context.user_data['source_id'] = context.user_data['chat_id']
+    context.user_data['source_title'] = context.user_data['chat_title']
     update.message.reply_text(f"✅ Source set.\nNow, send the **Destination**.", parse_mode='Markdown')
     return DESTINATION
 
 def get_destination(update: Update, context: CallbackContext) -> int:
-    # ... (code is the same as before) ...
-    if update.message.forward_from_chat:
-        context.user_data['destination_id'] = update.message.forward_from_chat.id
-        context.user_data['destination_title'] = update.message.forward_from_chat.title
-    elif update.message.forward_from:
-        context.user_data['destination_id'] = update.message.forward_from.id
-        context.user_data['destination_title'] = update.message.forward_from.first_name
-    else:
-        try:
-            context.user_data['destination_id'] = int(update.message.text)
-            context.user_data['destination_title'] = f"ID: {update.message.text}"
-        except: return DESTINATION
+    if not get_chat_id(update, context): return DESTINATION
+    context.user_data['destination_id'] = context.user_data['chat_id']
+    context.user_data['destination_title'] = context.user_data['chat_title']
     update.message.reply_text("✅ Destination set.\nNow, send **Blacklist** words separated by a comma.\nSend /skip to ignore.", reply_markup=ReplyKeyboardRemove())
     return BLACKLIST
 
@@ -193,9 +179,8 @@ def get_blacklist(update: Update, context: CallbackContext) -> int:
 def get_whitelist(update: Update, context: CallbackContext) -> int:
     if update.message.text.lower() == '/skip': context.user_data['whitelist'] = None
     else: context.user_data['whitelist'] = update.message.text
-    
     reply_markup = build_media_filter_menu(context)
-    update.message.reply_text("✅ Whitelist set.\nNow, configure which media types to **block**. ✅ means FORWARD, 🚫 means BLOCK.", reply_markup=reply_markup)
+    update.message.reply_text("✅ Whitelist set.\nNow, configure which media types to **block**.", reply_markup=reply_markup)
     return MEDIA_FILTER
 
 def media_filter_callback(update: Update, context: CallbackContext) -> int:
@@ -204,7 +189,6 @@ def media_filter_callback(update: Update, context: CallbackContext) -> int:
     toggle = query.data.replace('toggle_', '')
     
     if toggle == 'done_media_filter':
-        # User is done, move to confirmation
         ud = context.user_data
         mf = ud['media_filters']
         summary = (
@@ -213,17 +197,16 @@ def media_filter_callback(update: Update, context: CallbackContext) -> int:
             f"↘️ **To:** {ud['destination_title']}\n\n"
             f"🚫 **Blacklist:** `{ud['blacklist'] or 'Not set'}`\n"
             f"✅ **Whitelist:** `{ud['whitelist'] or 'Not set'}`\n\n"
-            f"**Blocked Media Types:**\n"
-            f"  Photos: {'🚫' if mf['photos'] else '✅'}\n"
-            f"  Videos: {'🚫' if mf['videos'] else '✅'}\n"
-            f"  Files: {'🚫' if mf['documents'] else '✅'}\n"
-            f"  Text: {'🚫' if mf['text'] else '✅'}\n"
+            f"**Media Forwarding Status:**\n"
+            f"  Photos: {'✅' if not mf['photos'] else '🚫'}\n"
+            f"  Videos: {'✅' if not mf['videos'] else '🚫'}\n"
+            f"  Files: {'✅' if not mf['documents'] else '🚫'}\n"
+            f"  Text: {'✅' if not mf['text'] else '🚫'}\n"
         )
         query.edit_message_text(summary, parse_mode='Markdown')
         update.effective_chat.send_message("Is this correct?", reply_markup=ReplyKeyboardMarkup([['Confirm', 'Cancel']], one_time_keyboard=True))
         return CONFIRMATION
 
-    # Toggle the setting
     context.user_data['media_filters'][toggle] = not context.user_data['media_filters'][toggle]
     reply_markup = build_media_filter_menu(context)
     query.edit_message_reply_markup(reply_markup)
@@ -283,7 +266,6 @@ def delete_task_start(update: Update, context: CallbackContext) -> int:
     return 0
 
 def delete_task_confirm(update: Update, context: CallbackContext) -> int:
-    # This function is unchanged
     try:
         task_id = int(update.message.text)
         conn = sqlite3.connect(DB_FILE)
@@ -297,14 +279,13 @@ def delete_task_confirm(update: Update, context: CallbackContext) -> int:
         update.message.reply_text("Invalid ID. Please send a number.")
     return ConversationHandler.END
 
-
 def cancel(update: Update, context: CallbackContext) -> int:
     update.message.reply_text('Operation cancelled.', reply_markup=ReplyKeyboardRemove())
     return ConversationHandler.END
 
 async def main():
     init_db()
-    updater = Updater(BOT_TOKEN)
+    updater = Updater(BOT_TOKEN, use_context=True)
     dp = updater.dispatcher
 
     conv_handler = ConversationHandler(
@@ -312,8 +293,9 @@ async def main():
         states={
             SOURCE: [MessageHandler(Filters.all & ~Filters.command, get_source)],
             DESTINATION: [MessageHandler(Filters.all & ~Filters.command, get_destination)],
-            BLACKLIST: [MessageHandler(Filters.text & ~Filters.command, get_blacklist)],
-            WHITELIST: [MessageHandler(Filters.text & ~Filters.command, get_whitelist)],
+            # **THE FIX IS HERE:** We now use Filters.text to allow the /skip command
+            BLACKLIST: [MessageHandler(Filters.text, get_blacklist)],
+            WHITELIST: [MessageHandler(Filters.text, get_whitelist)],
             MEDIA_FILTER: [CallbackQueryHandler(media_filter_callback)],
             CONFIRMATION: [MessageHandler(Filters.regex('^(Confirm|Cancel)$'), save_task)],
         },
