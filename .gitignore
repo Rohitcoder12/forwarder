@@ -1,0 +1,16 @@
+# Python virtual environment
+venv/
+__pycache__/
+
+# Session and database files (sensitive data)
+*.session
+*.session-journal
+*.db
+
+# Environment file with secrets
+.env
+
+# IDE and OS files
+.idea/
+.vscode/
+*.DS_Store
