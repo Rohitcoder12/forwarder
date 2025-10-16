@@ -54,6 +54,7 @@ client = TelegramClient(SESSION_NAME, int(API_ID), API_HASH)
 @client.on(events.NewMessage())
 async def handle_new_message(event):
     """Listens for new messages and forwards them based on tasks in the database."""
+    print(f"DEBUG: New message received from chat ID: {event.chat_id}") # <-- ADD THIS LINE
     chat_id = event.chat_id
     
     conn = sqlite3.connect(DB_FILE)
