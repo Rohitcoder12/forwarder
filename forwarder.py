@@ -56,6 +56,7 @@ async def generate_thumbnail(video_path):
     try:
         thumb_path = os.path.splitext(video_path)[0] + ".jpg"
         cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened(): return None
         ret, frame = cap.read()
         if not ret:
             cap.release()
@@ -104,8 +105,8 @@ async def handle_new_message(event):
             except: pass
 
         full_text = (message.text or "").lower()
-        if wl and not any(w in full_text for w in wl.lower().split(',')): continue
-        if bl and any(w in full_text for w in bl.lower().split(',')): continue
+        if wl and not any(w.strip() in full_text for w in wl.lower().split(',')): continue
+        if bl and any(w.strip() in full_text for w in bl.lower().split(',')): continue
 
         final_caption = message.text
         if beautify:
@@ -120,7 +121,7 @@ async def handle_new_message(event):
             try: dest_id = int(dest_id_str.strip())
             except ValueError: continue
 
-            print(f"Forwarding message {message.id} to {dest_id}")
+            print(f"Attempting to forward message {message.id} to {dest_id}")
             dl_path, thumb_path = None, None
             try:
                 if message.media:
@@ -137,8 +138,7 @@ async def handle_new_message(event):
 # --- TELEGRAM BOT (THE INTERFACE) ---
 
 SOURCE, DESTINATION, BLACKLIST, WHITELIST, MEDIA_FILTER, USER_FILTER, CAPTION_SETTING, CONFIRMATION = range(8)
-
-def build_menu(buttons, n_cols): return [buttons[i:i + n_cols] for i in range(0, len(buttons), n_cols)]
+DELETE_TASK = 0 # State for delete conversation
 
 def start(update: Update, context: CallbackContext) -> None:
     update.message.reply_text("Welcome! Use /newtask, /tasks, and /delete.")
@@ -153,7 +153,11 @@ def new_task_start(update: Update, context: CallbackContext) -> int:
     update.message.reply_text("Let's start. First, define the Source chat.")
     return SOURCE
 
+# ... (All get_* and callback functions for the /newtask flow are unchanged) ...
+# I will include them here for completeness.
+
 def get_chat_id(update, context, key_prefix):
+    # This helper is unchanged
     if update.message.forward_from_chat:
         id_val = update.message.forward_from_chat.id
         title_val = update.message.forward_from_chat.title or "N/A"
@@ -189,26 +193,46 @@ def get_whitelist(update: Update, context: CallbackContext) -> int:
     update.message.reply_text("✅ Whitelist set. Configure media to block (🚫=BLOCK).", reply_markup=InlineKeyboardMarkup(keyboard))
     return MEDIA_FILTER
 
-def filter_callback(update: Update, context: CallbackContext, filter_type, next_state, build_next_menu):
+def build_user_filter_menu(context: CallbackContext):
+    ud = context.user_data['user_filters']
+    keyboard = [
+        [InlineKeyboardButton(f"{'🚫' if ud['replies'] else '✅'} Replies to Me", callback_data='user_replies'),
+         InlineKeyboardButton(f"{'🚫' if ud['own'] else '✅'} My Msgs", callback_data='user_own')],
+        [InlineKeyboardButton("➡️ Done", callback_data='user_done')]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def media_filter_callback(update: Update, context: CallbackContext):
     query = update.callback_query
     query.answer()
     action = query.data.split('_')[1]
 
     if action == 'done':
-        query.edit_message_text(f"✅ {filter_type.capitalize()} filters saved.")
-        reply_markup = build_next_menu(context)
-        query.message.reply_text(f"Next, configure {build_next_menu.__name__.split('_')[1]} filters.", reply_markup=reply_markup)
-        return next_state
+        query.edit_message_text("✅ Media filters saved.")
+        reply_markup = build_user_filter_menu(context)
+        query.message.reply_text("Next, configure user filters.", reply_markup=reply_markup)
+        return USER_FILTER
 
-    context.user_data[f'{filter_type}_filters'][action] = not context.user_data[f'{filter_type}_filters'][action]
-    query.edit_message_reply_markup(globals()[f'build_{filter_type}_filter_menu'](context))
-    return globals()[f'{filter_type.upper()}_FILTER']
-
-def media_filter_callback(update: Update, context: CallbackContext):
-    return filter_callback(update, context, 'media', USER_FILTER, build_user_filter_menu)
+    context.user_data['media_filters'][action] = not context.user_data['media_filters'][action]
+    ud = context.user_data['media_filters']
+    keyboard = [[InlineKeyboardButton(f"{'🚫' if ud[k] else '✅'} {k.capitalize()}", callback_data=f'media_{k}') for k in ud], [InlineKeyboardButton("➡️ Done", callback_data='media_done')]]
+    query.edit_message_reply_markup(InlineKeyboardMarkup(keyboard))
+    return MEDIA_FILTER
 
 def user_filter_callback(update: Update, context: CallbackContext):
-    return filter_callback(update, context, 'user', CAPTION_SETTING, lambda ctx: InlineKeyboardMarkup([[InlineKeyboardButton("Yes, Enable It", callback_data='caption_yes'), InlineKeyboardButton("No, Keep Original", callback_data='caption_no')]]))
+    query = update.callback_query
+    query.answer()
+    action = query.data.split('_')[1]
+
+    if action == 'done':
+        query.edit_message_text("✅ User filters saved.")
+        keyboard = [[InlineKeyboardButton("Yes, Enable It", callback_data='caption_yes'), InlineKeyboardButton("No, Keep Original", callback_data='caption_no')]]
+        query.message.reply_text("Enable 'Beautiful Captioning' for Terabox links?", reply_markup=InlineKeyboardMarkup(keyboard))
+        return CAPTION_SETTING
+    
+    context.user_data['user_filters']['replies' if action == 'replies' else 'own'] = not context.user_data['user_filters']['replies' if action == 'replies' else 'own']
+    query.edit_message_reply_markup(build_user_filter_menu(context))
+    return USER_FILTER
 
 def caption_setting_callback(update: Update, context: CallbackContext) -> int:
     query = update.callback_query
@@ -219,7 +243,7 @@ def caption_setting_callback(update: Update, context: CallbackContext) -> int:
                f"➡️ From: {ud['source_title']} ({ud['source_ids']})\n"
                f"↘️ To: {ud['destination_title']} ({ud['destination_ids']})\n\n"
                f"Blacklist: `{ud['blacklist'] or 'N/A'}`\nWhitelist: `{ud['whitelist'] or 'N/A'}`\n\n"
-               f"🚫 Blocking: {', '.join([k for k, v in mf.items() if v] + [k for k, v in {'Replies':uf['replies'], 'My Msgs':uf['own']}.items() if v]) or 'None'}\n"
+               f"🚫 Blocking: {', '.join([k.capitalize() for k, v in mf.items() if v] + [name for name, val in [('Replies to me', uf['replies']), ('My own msgs', uf['own'])] if val]) or 'None'}\n"
                f"✨ Beautiful Captions: {'✅ Yes' if bc else '🚫 No'}")
     query.edit_message_text(summary, parse_mode='Markdown')
     update.effective_chat.send_message("Is this correct?", reply_markup=ReplyKeyboardMarkup([['Confirm', 'Cancel']], one_time_keyboard=True))
@@ -246,7 +270,32 @@ def list_tasks(update: Update, context: CallbackContext) -> None:
     msg = "".join([f"🔹 ID: {t[0]}\n   From: `{t[1]}`\n   To: `{t[2]}`\n   Captions: {'✅' if t[3] else '🚫'}\n\n" for t in tasks])
     update.message.reply_text("Your active tasks:\n\n" + msg, parse_mode='Markdown')
 
-# ... (delete_task_start, delete_task_confirm, cancel are unchanged) ...
+# --- **MISSING FUNCTIONS RESTORED HERE** ---
+def delete_task_start(update: Update, context: CallbackContext) -> int:
+    list_tasks(update, context)
+    update.message.reply_text("Please send the Task ID you want to delete.")
+    return DELETE_TASK
+
+def delete_task_confirm(update: Update, context: CallbackContext) -> int:
+    try:
+        task_id = int(update.message.text)
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+        conn.commit()
+        if cursor.rowcount > 0:
+            update.message.reply_text(f"✅ Task {task_id} has been deleted.")
+        else:
+            update.message.reply_text(f"❌ Task {task_id} not found.")
+        conn.close()
+    except ValueError:
+        update.message.reply_text("Invalid ID. Please send a number.")
+    return ConversationHandler.END
+
+def cancel(update: Update, context: CallbackContext) -> int:
+    update.message.reply_text('Operation cancelled.', reply_markup=ReplyKeyboardRemove())
+    return ConversationHandler.END
+# --- END OF RESTORED FUNCTIONS ---
 
 async def main():
     global MY_ID
@@ -268,11 +317,20 @@ async def main():
         },
         fallbacks=[CommandHandler('cancel', cancel)],
     )
-    # ... (add handlers, start bot, etc. as before) ...
+    
+    # --- **DELETE HANDLER ADDED CORRECTLY HERE** ---
+    delete_handler = ConversationHandler(
+        entry_points=[CommandHandler('delete', delete_task_start)],
+        states={
+            DELETE_TASK: [MessageHandler(Filters.text & ~Filters.command, delete_task_confirm)]
+        },
+        fallbacks=[CommandHandler('cancel', cancel)]
+    )
+    
     dp.add_handler(conv_handler)
     dp.add_handler(CommandHandler("start", start))
     dp.add_handler(CommandHandler("tasks", list_tasks))
-    # Add delete handler
+    dp.add_handler(delete_handler) # This line was missing
     
     updater.start_polling()
     print("Control Bot started...")
