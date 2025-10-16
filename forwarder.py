@@ -23,7 +23,6 @@ BOT_TOKEN = os.getenv('BOT_TOKEN')
 SESSION_NAME = 'telegram_forwarder'
 
 # --- SANITY CHECK ---
-# Ensure essential environment variables are set before starting.
 if not all([API_ID, API_HASH, BOT_TOKEN]):
     raise RuntimeError(
         "CRITICAL ERROR: API_ID, API_HASH, and BOT_TOKEN must be set in your .env file."
@@ -33,7 +32,6 @@ if not all([API_ID, API_HASH, BOT_TOKEN]):
 DB_FILE = 'tasks.db'
 
 def init_db():
-    """Initializes the SQLite database and the tasks table."""
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute('''
@@ -48,14 +46,10 @@ def init_db():
     conn.close()
 
 # --- TELETHON CLIENT (THE ENGINE) ---
-# This part logs into your user account to listen for and forward messages.
 client = TelegramClient(SESSION_NAME, int(API_ID), API_HASH)
 
 @client.on(events.NewMessage())
 async def handle_new_message(event):
-    """Listens for new messages and forwards them based on tasks in the database."""
-    # Uncomment the line below for future debugging if needed.
-    # print(f"DEBUG: New message received from chat ID: {event.chat_id}")
     chat_id = event.chat_id
     
     conn = sqlite3.connect(DB_FILE)
@@ -71,34 +65,51 @@ async def handle_new_message(event):
     
     for destination_id, only_replies in tasks:
         if only_replies and not message.is_reply:
-            print(f"Skipping message {message.id} from {chat_id}: not a reply.")
             continue
 
         print(f"Forwarding message {message.id} from {chat_id} to {destination_id}")
         
+        # **NEW, MORE ROBUST MEDIA HANDLING LOGIC**
+        downloaded_file_path = None
         try:
-            # **THE FIX IS HERE:**
-            # We explicitly send the message text and media file instead of the whole message object.
-            # This creates a new, clean message and avoids potential metadata/permission conflicts
-            # even when you are the owner of the channel.
-            await client.send_message(
-                entity=destination_id,
-                message=message.text,
-                file=message.media,
-                reply_to=message.reply_to_msg_id if message.is_reply else None
-            )
+            if message.media:
+                # 1. Download the media to the server's local disk
+                print(f"Downloading media for message {message.id}...")
+                downloaded_file_path = await message.download_media()
+                print(f"Media downloaded to: {downloaded_file_path}")
+
+                # 2. Send the local file
+                await client.send_file(
+                    entity=destination_id,
+                    file=downloaded_file_path,
+                    caption=message.text, # Use message.text as the caption
+                    reply_to=message.reply_to_msg_id if message.is_reply else None
+                )
+            elif message.text:
+                # 3. If it's just a text message, send the text
+                await client.send_message(
+                    entity=destination_id,
+                    message=message.text,
+                    reply_to=message.reply_to_msg_id if message.is_reply else None
+                )
+            print("Message forwarded successfully.")
+
         except Exception as e:
             print(f"Could not forward message {message.id}. Error: {e}")
+        finally:
+            # 4. CRUCIAL: Clean up by deleting the temporary file
+            if downloaded_file_path and os.path.exists(downloaded_file_path):
+                os.remove(downloaded_file_path)
+                print(f"Cleaned up temporary file: {downloaded_file_path}")
 
 
 # --- TELEGRAM BOT (THE INTERFACE) ---
-# This part handles commands from you to manage the forwarding tasks.
+# ... (The rest of the bot interface code is unchanged and correct) ...
 
 # Conversation states for the /newtask command
 SOURCE, DESTINATION, FILTER_REPLY, CONFIRMATION = range(4)
 
 def get_chat_id_from_update(update: Update, context: CallbackContext) -> bool:
-    """Helper function to extract chat ID from a forwarded message or text."""
     if update.message.forward_from_chat:
         context.user_data['chat_id'] = update.message.forward_from_chat.id
         context.user_data['chat_title'] = update.message.forward_from_chat.title or "N/A"
@@ -252,7 +263,6 @@ def cancel(update: Update, context: CallbackContext) -> int:
     return ConversationHandler.END
 
 async def main():
-    """Main function to set up and run both the bot and the client."""
     init_db()
     updater = Updater(BOT_TOKEN)
     dp = updater.dispatcher
