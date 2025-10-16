@@ -1,0 +1,9 @@
+# For the user account client (Telethon)
+telethon
+
+# For the control bot interface (python-telegram-bot)
+# Version 13.7 is specified for compatibility with the provided code.
+python-telegram-bot==13.7
+
+# For loading secret credentials from the .env file
+python-dotenv
