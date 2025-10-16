@@ -3,7 +3,8 @@ import asyncio
 import os
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telethon.tl.types import MessageEntityMention
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Updater,
     CommandHandler,
@@ -11,22 +12,20 @@ from telegram.ext import (
     Filters,
     ConversationHandler,
     CallbackContext,
+    CallbackQueryHandler,
 )
 
-# Load environment variables from a .env file
+# Load environment variables
 load_dotenv()
 
-# --- CONFIGURATION (loaded from .env file) ---
+# --- CONFIGURATION ---
 API_ID = os.getenv('API_ID')
 API_HASH = os.getenv('API_HASH')
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 SESSION_NAME = 'telegram_forwarder'
 
-# --- SANITY CHECK ---
 if not all([API_ID, API_HASH, BOT_TOKEN]):
-    raise RuntimeError(
-        "CRITICAL ERROR: API_ID, API_HASH, and BOT_TOKEN must be set in your .env file."
-    )
+    raise RuntimeError("CRITICAL ERROR: API_ID, API_HASH, and BOT_TOKEN must be set in your .env file.")
 
 # --- DATABASE SETUP ---
 DB_FILE = 'tasks.db'
@@ -34,15 +33,17 @@ DB_FILE = 'tasks.db'
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    # NEW: Added blacklist_words and whitelist_words columns
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS tasks (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             source_id INTEGER NOT NULL,
             destination_id INTEGER NOT NULL,
-            only_replies BOOLEAN NOT NULL DEFAULT 0,
             blacklist_words TEXT,
-            whitelist_words TEXT
+            whitelist_words TEXT,
+            block_photos BOOLEAN NOT NULL DEFAULT 0,
+            block_videos BOOLEAN NOT NULL DEFAULT 0,
+            block_documents BOOLEAN NOT NULL DEFAULT 0,
+            block_text BOOLEAN NOT NULL DEFAULT 0
         )
     ''')
     conn.commit()
@@ -58,36 +59,48 @@ async def handle_new_message(event):
     
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    # NEW: Fetching the new filter columns
-    cursor.execute(
-        "SELECT destination_id, only_replies, blacklist_words, whitelist_words FROM tasks WHERE source_id = ?", 
-        (chat_id,)
-    )
+    cursor.execute("SELECT * FROM tasks WHERE source_id = ?", (chat_id,))
     tasks = cursor.fetchall()
     conn.close()
 
     if not tasks:
         return
 
-    full_text = (message.text or "").lower()
+    for task in tasks:
+        # Unpack task data from the database row
+        _, _, destination_id, blacklist, whitelist, block_photos, block_videos, block_documents, block_text = task
 
-    for destination_id, only_replies, blacklist, whitelist in tasks:
-        # Filter for replies (your use case will be 'No')
-        if only_replies and not message.is_reply:
+        # --- NEW: Media Type Filtering ---
+        if (block_photos and message.photo) or \
+           (block_videos and message.video) or \
+           (block_documents and message.document and not message.video and not message.photo) or \
+           (block_text and message.text and not message.media):
+            print(f"Skipping message {message.id}: Media type is blocked by task settings.")
             continue
 
-        # NEW: Whitelist Filter Logic
+        # --- NEW: Robust Whitelist/Blacklist Logic ---
+        full_text = (message.text or "").lower()
+        mentions = []
+        if message.entities:
+            for entity in message.entities:
+                if isinstance(entity, MessageEntityMention):
+                    # Extract mention text like '@username'
+                    mention_text = message.text[entity.offset : entity.offset + entity.length].lower()
+                    mentions.append(mention_text)
+
+        # Whitelist Check
         if whitelist:
-            whitelist_words = [word.strip() for word in whitelist.lower().split(',')]
-            if not any(word in full_text for word in whitelist_words):
-                print(f"Skipping message {message.id}: No whitelist words found.")
+            whitelist_words = [word.strip().lower() for word in whitelist.split(',')]
+            # Check if any whitelist word is in the text OR if any whitelisted @mention matches
+            if not any(word in full_text for word in whitelist_words) and not any(mention in mentions for mention in whitelist_words):
+                print(f"Skipping message {message.id}: No whitelist criteria met.")
                 continue
 
-        # NEW: Blacklist Filter Logic
+        # Blacklist Check
         if blacklist:
-            blacklist_words = [word.strip() for word in blacklist.lower().split(',')]
-            if any(word in full_text for word in blacklist_words):
-                print(f"Skipping message {message.id}: A blacklist word was found.")
+            blacklist_words = [word.strip().lower() for word in blacklist.split(',')]
+            if any(word in full_text for word in blacklist_words) or any(mention in mentions for mention in blacklist_words):
+                print(f"Skipping message {message.id}: Blacklist criteria met.")
                 continue
         
         print(f"Forwarding message {message.id} from {chat_id} to {destination_id}")
@@ -100,16 +113,13 @@ async def handle_new_message(event):
                     entity=destination_id,
                     file=downloaded_file_path,
                     caption=message.text,
-                    reply_to=message.reply_to_msg_id if message.is_reply else None
                 )
             elif message.text:
                 await client.send_message(
                     entity=destination_id,
                     message=message.text,
-                    reply_to=message.reply_to_msg_id if message.is_reply else None
                 )
             print("Message forwarded successfully.")
-
         except Exception as e:
             print(f"Could not forward message {message.id}. Error: {e}")
         finally:
@@ -118,103 +128,119 @@ async def handle_new_message(event):
 
 # --- TELEGRAM BOT (THE INTERFACE) ---
 
-# NEW: Updated conversation states
-SOURCE, DESTINATION, FILTER_REPLY, BLACKLIST, WHITELIST, CONFIRMATION = range(6)
+SOURCE, DESTINATION, BLACKLIST, WHITELIST, MEDIA_FILTER, CONFIRMATION = range(6)
 
-def get_chat_id_from_update(update: Update, context: CallbackContext) -> bool:
-    # This function is unchanged
-    if update.message.forward_from_chat:
-        context.user_data['chat_id'] = update.message.forward_from_chat.id
-        context.user_data['chat_title'] = update.message.forward_from_chat.title or "N/A"
-    elif update.message.forward_from:
-        context.user_data['chat_id'] = update.message.forward_from.id
-        context.user_data['chat_title'] = update.message.forward_from.first_name
-    else:
-        try:
-            context.user_data['chat_id'] = int(update.message.text)
-            context.user_data['chat_title'] = f"ID: {update.message.text}"
-        except (ValueError, TypeError):
-            update.message.reply_text("Invalid input. Please forward a message or send the numeric ID.")
-            return False
-    return True
+# Helper functions for the new UI
+def build_media_filter_menu(context: CallbackContext):
+    ud = context.user_data['media_filters']
+    keyboard = [
+        [InlineKeyboardButton(f"{'✅' if not ud['photos'] else '🚫'} Block Photos", callback_data='toggle_photos')],
+        [InlineKeyboardButton(f"{'✅' if not ud['videos'] else '🚫'} Block Videos", callback_data='toggle_videos')],
+        [InlineKeyboardButton(f"{'✅' if not ud['documents'] else '🚫'} Block Documents/Files", callback_data='toggle_documents')],
+        [InlineKeyboardButton(f"{'✅' if not ud['text'] else '🚫'} Block Text-Only", callback_data='toggle_text')],
+        [InlineKeyboardButton("➡️ Done ➡️", callback_data='done_media_filter')]
+    ]
+    return InlineKeyboardMarkup(keyboard)
 
 def start(update: Update, context: CallbackContext) -> None:
-    # This function is unchanged
     update.message.reply_text("Welcome! Use /newtask to set up forwarding, /tasks to view, and /delete to remove.")
 
 def new_task_start(update: Update, context: CallbackContext) -> int:
-    # This function is unchanged
+    # Initialize filters at the start
+    context.user_data['media_filters'] = {'photos': False, 'videos': False, 'documents': False, 'text': False}
     update.message.reply_text("Let's set up a new task. First, define the Source chat.")
     return SOURCE
 
+# ... get_source and get_destination are mostly unchanged ...
 def get_source(update: Update, context: CallbackContext) -> int:
-    # This function is unchanged
-    if not get_chat_id_from_update(update, context): return SOURCE
-    context.user_data['source_id'] = context.user_data['chat_id']
-    context.user_data['source_title'] = context.user_data['chat_title']
-    update.message.reply_text(f"✅ Source set to: **{context.user_data['source_title']}**\n\nNow, send the **Destination**.", parse_mode='Markdown')
+    # ... (code is the same as before) ...
+    if update.message.forward_from_chat:
+        context.user_data['source_id'] = update.message.forward_from_chat.id
+        context.user_data['source_title'] = update.message.forward_from_chat.title
+    elif update.message.forward_from:
+        context.user_data['source_id'] = update.message.forward_from.id
+        context.user_data['source_title'] = update.message.forward_from.first_name
+    else:
+        try:
+            context.user_data['source_id'] = int(update.message.text)
+            context.user_data['source_title'] = f"ID: {update.message.text}"
+        except: return SOURCE
+    update.message.reply_text(f"✅ Source set.\nNow, send the **Destination**.", parse_mode='Markdown')
     return DESTINATION
 
 def get_destination(update: Update, context: CallbackContext) -> int:
-    # This function is unchanged
-    if not get_chat_id_from_update(update, context): return DESTINATION
-    context.user_data['destination_id'] = context.user_data['chat_id']
-    context.user_data['destination_title'] = context.user_data['chat_title']
-    update.message.reply_text(f"✅ Destination set.\n\nForward **only replies**?", reply_markup=ReplyKeyboardMarkup([['Yes', 'No']], one_time_keyboard=True))
-    return FILTER_REPLY
-
-def get_filter_reply(update: Update, context: CallbackContext) -> int:
-    # NEW: Transitions to BLACKLIST instead of CONFIRMATION
-    context.user_data['only_replies'] = (update.message.text.lower() == 'yes')
-    update.message.reply_text("Now, let's set a **Blacklist**.\nSend words separated by a comma (e.g., `spam,crypto,scam`). If a message contains any of these, it will be ignored.\n\nSend /skip to not use a blacklist.", reply_markup=ReplyKeyboardRemove())
+    # ... (code is the same as before) ...
+    if update.message.forward_from_chat:
+        context.user_data['destination_id'] = update.message.forward_from_chat.id
+        context.user_data['destination_title'] = update.message.forward_from_chat.title
+    elif update.message.forward_from:
+        context.user_data['destination_id'] = update.message.forward_from.id
+        context.user_data['destination_title'] = update.message.forward_from.first_name
+    else:
+        try:
+            context.user_data['destination_id'] = int(update.message.text)
+            context.user_data['destination_title'] = f"ID: {update.message.text}"
+        except: return DESTINATION
+    update.message.reply_text("✅ Destination set.\nNow, send **Blacklist** words separated by a comma.\nSend /skip to ignore.", reply_markup=ReplyKeyboardRemove())
     return BLACKLIST
 
 def get_blacklist(update: Update, context: CallbackContext) -> int:
-    # NEW function to handle blacklist words
-    if update.message.text.lower() == '/skip':
-        context.user_data['blacklist'] = None
-    else:
-        context.user_data['blacklist'] = update.message.text
-    update.message.reply_text("✅ Blacklist set.\n\nNow, let's set a **Whitelist**.\nSend words separated by a comma. A message will ONLY be forwarded if it contains one of these words.\n\nSend /skip to not use a whitelist.")
+    if update.message.text.lower() == '/skip': context.user_data['blacklist'] = None
+    else: context.user_data['blacklist'] = update.message.text
+    update.message.reply_text("✅ Blacklist set.\nNow, send **Whitelist** words.\nSend /skip to ignore.")
     return WHITELIST
 
 def get_whitelist(update: Update, context: CallbackContext) -> int:
-    # NEW function to handle whitelist words and show final confirmation
-    if update.message.text.lower() == '/skip':
-        context.user_data['whitelist'] = None
-    else:
-        context.user_data['whitelist'] = update.message.text
+    if update.message.text.lower() == '/skip': context.user_data['whitelist'] = None
+    else: context.user_data['whitelist'] = update.message.text
+    
+    reply_markup = build_media_filter_menu(context)
+    update.message.reply_text("✅ Whitelist set.\nNow, configure which media types to **block**. ✅ means FORWARD, 🚫 means BLOCK.", reply_markup=reply_markup)
+    return MEDIA_FILTER
 
-    # Build the summary text
-    summary = (
-        f"Please confirm your new task:\n\n"
-        f"➡️ **From:** {context.user_data['source_title']} (`{context.user_data['source_id']}`)\n"
-        f"↘️ **To:** {context.user_data['destination_title']} (`{context.user_data['destination_id']}`)\n"
-        f"💬 **Only Replies:** {'Yes' if context.user_data['only_replies'] else 'No'}\n"
-        f"🚫 **Blacklist:** `{context.user_data['blacklist'] or 'Not set'}`\n"
-        f"✅ **Whitelist:** `{context.user_data['whitelist'] or 'Not set'}`\n\n"
-        "Is this correct?"
-    )
-    update.message.reply_text(summary, parse_mode='Markdown', reply_markup=ReplyKeyboardMarkup([['Confirm', 'Cancel']], one_time_keyboard=True))
-    return CONFIRMATION
+def media_filter_callback(update: Update, context: CallbackContext) -> int:
+    query = update.callback_query
+    query.answer()
+    toggle = query.data.replace('toggle_', '')
+    
+    if toggle == 'done_media_filter':
+        # User is done, move to confirmation
+        ud = context.user_data
+        mf = ud['media_filters']
+        summary = (
+            f"Please confirm your new task:\n\n"
+            f"➡️ **From:** {ud['source_title']}\n"
+            f"↘️ **To:** {ud['destination_title']}\n\n"
+            f"🚫 **Blacklist:** `{ud['blacklist'] or 'Not set'}`\n"
+            f"✅ **Whitelist:** `{ud['whitelist'] or 'Not set'}`\n\n"
+            f"**Blocked Media Types:**\n"
+            f"  Photos: {'🚫' if mf['photos'] else '✅'}\n"
+            f"  Videos: {'🚫' if mf['videos'] else '✅'}\n"
+            f"  Files: {'🚫' if mf['documents'] else '✅'}\n"
+            f"  Text: {'🚫' if mf['text'] else '✅'}\n"
+        )
+        query.edit_message_text(summary, parse_mode='Markdown')
+        update.effective_chat.send_message("Is this correct?", reply_markup=ReplyKeyboardMarkup([['Confirm', 'Cancel']], one_time_keyboard=True))
+        return CONFIRMATION
+
+    # Toggle the setting
+    context.user_data['media_filters'][toggle] = not context.user_data['media_filters'][toggle]
+    reply_markup = build_media_filter_menu(context)
+    query.edit_message_reply_markup(reply_markup)
+    return MEDIA_FILTER
 
 def save_task(update: Update, context: CallbackContext) -> int:
-    # NEW: Saves the new filter data to the database
     if update.message.text.lower() != 'confirm':
         update.message.reply_text("Task cancelled.", reply_markup=ReplyKeyboardRemove())
         return ConversationHandler.END
 
+    ud = context.user_data
+    mf = ud['media_filters']
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute(
-        "INSERT INTO tasks (source_id, destination_id, only_replies, blacklist_words, whitelist_words) VALUES (?, ?, ?, ?, ?)",
-        (
-            context.user_data['source_id'], 
-            context.user_data['destination_id'], 
-            context.user_data['only_replies'],
-            context.user_data['blacklist'],
-            context.user_data['whitelist']
-        )
+        "INSERT INTO tasks (source_id, destination_id, blacklist_words, whitelist_words, block_photos, block_videos, block_documents, block_text) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (ud['source_id'], ud['destination_id'], ud['blacklist'], ud['whitelist'], mf['photos'], mf['videos'], mf['documents'], mf['text'])
     )
     conn.commit()
     conn.close()
@@ -223,10 +249,9 @@ def save_task(update: Update, context: CallbackContext) -> int:
     return ConversationHandler.END
 
 def list_tasks(update: Update, context: CallbackContext) -> None:
-    # NEW: Displays the filter words for each task
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    cursor.execute("SELECT id, source_id, destination_id, blacklist_words, whitelist_words FROM tasks")
+    cursor.execute("SELECT * FROM tasks")
     tasks = cursor.fetchall()
     conn.close()
 
@@ -234,19 +259,25 @@ def list_tasks(update: Update, context: CallbackContext) -> None:
         update.message.reply_text("You have no active tasks.")
         return
 
-    message = "Your active tasks:\n\n"
-    for task_id, source, dest, blacklist, whitelist in tasks:
-        message += (
+    message_text = "Your active tasks:\n\n"
+    for task in tasks:
+        task_id, source, dest, blacklist, whitelist, no_photo, no_video, no_doc, no_text = task
+        blocked = []
+        if no_photo: blocked.append('Photos')
+        if no_video: blocked.append('Videos')
+        if no_doc: blocked.append('Files')
+        if no_text: blocked.append('Text')
+        
+        message_text += (
             f"🔹 **Task ID:** {task_id}\n"
-            f"   **From:** `{source}`\n"
-            f"   **To:** `{dest}`\n"
+            f"   **From:** `{source}` -> **To:** `{dest}`\n"
             f"   **Blacklist:** `{blacklist or 'None'}`\n"
-            f"   **Whitelist:** `{whitelist or 'None'}`\n\n"
+            f"   **Whitelist:** `{whitelist or 'None'}`\n"
+            f"   **Blocking:** `{', '.join(blocked) or 'None'}`\n\n"
         )
-    update.message.reply_text(message, parse_mode='Markdown')
+    update.message.reply_text(message_text, parse_mode='Markdown')
 
 def delete_task_start(update: Update, context: CallbackContext) -> int:
-    # This function is unchanged
     list_tasks(update, context)
     update.message.reply_text("Please send the Task ID you want to delete.")
     return 0
@@ -266,8 +297,8 @@ def delete_task_confirm(update: Update, context: CallbackContext) -> int:
         update.message.reply_text("Invalid ID. Please send a number.")
     return ConversationHandler.END
 
+
 def cancel(update: Update, context: CallbackContext) -> int:
-    # This function is unchanged
     update.message.reply_text('Operation cancelled.', reply_markup=ReplyKeyboardRemove())
     return ConversationHandler.END
 
@@ -276,30 +307,30 @@ async def main():
     updater = Updater(BOT_TOKEN)
     dp = updater.dispatcher
 
-    # NEW: Updated ConversationHandler with new states and entry points
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler('newtask', new_task_start)],
         states={
             SOURCE: [MessageHandler(Filters.all & ~Filters.command, get_source)],
             DESTINATION: [MessageHandler(Filters.all & ~Filters.command, get_destination)],
-            FILTER_REPLY: [MessageHandler(Filters.regex('^(Yes|No)$'), get_filter_reply)],
-            BLACKLIST: [MessageHandler(Filters.text, get_blacklist)],
-            WHITELIST: [MessageHandler(Filters.text, get_whitelist)],
+            BLACKLIST: [MessageHandler(Filters.text & ~Filters.command, get_blacklist)],
+            WHITELIST: [MessageHandler(Filters.text & ~Filters.command, get_whitelist)],
+            MEDIA_FILTER: [CallbackQueryHandler(media_filter_callback)],
             CONFIRMATION: [MessageHandler(Filters.regex('^(Confirm|Cancel)$'), save_task)],
         },
         fallbacks=[CommandHandler('cancel', cancel)],
     )
     
-    # ... Rest of main function is unchanged ...
     delete_handler = ConversationHandler(
         entry_points=[CommandHandler('delete', delete_task_start)],
         states={0: [MessageHandler(Filters.text & ~Filters.command, delete_task_confirm)]},
         fallbacks=[CommandHandler('cancel', cancel)]
     )
+    
+    dp.add_handler(conv_handler)
     dp.add_handler(CommandHandler("start", start))
     dp.add_handler(CommandHandler("tasks", list_tasks))
-    dp.add_handler(conv_handler)
     dp.add_handler(delete_handler)
+    
     updater.start_polling()
     print("Control Bot started...")
     await client.start()
