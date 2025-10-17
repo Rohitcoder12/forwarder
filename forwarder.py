@@ -51,7 +51,7 @@ def init_db():
     conn.commit()
     conn.close()
 
-# --- HELPER FUNCTION FOR THUMBNAILS ---
+# --- HELPER FUNCTIONS ---
 async def generate_thumbnail(video_path):
     try:
         thumb_path = os.path.splitext(video_path)[0] + ".jpg"
@@ -71,6 +71,20 @@ async def generate_thumbnail(video_path):
     except Exception as e:
         print(f"Thumbnail generation failed: {e}")
         return None
+
+def create_beautiful_caption(original_text):
+    # **THE FIX IS HERE: A much better regex to find all Tera- variations.**
+    link_pattern = r'https?://(?:tera[a-z]+|tinyurl)\.com/\S+'
+    links = re.findall(link_pattern, original_text or "")
+    
+    if not links:
+        return None # Return None if no links are found
+
+    emojis = random.sample(['😍', '🔥', '❤️', '😈', '💯', '💦', '🔞'], 2)
+    caption_parts = [f"Watch Full Videos {emojis[0]}{emojis[1]}\n"]
+    caption_parts.extend([f"V{i}: {link}" for i, link in enumerate(links, 1)])
+    return "\n".join(caption_parts)
+
 
 # --- TELETHON CLIENT (THE ENGINE) ---
 client = TelegramClient(SESSION_NAME, int(API_ID), API_HASH)
@@ -110,12 +124,10 @@ async def handle_new_message(event):
 
         final_caption = message.text
         if beautify:
-            links = re.findall(r'https?://(?:teraboxlink|terafileshare|tinyurl)\.com/\S+', message.text or "")
-            if links:
-                emojis = random.sample(['😍', '🔥', '❤️', '😈', '💯', '💦', '🔞'], 2)
-                caption_parts = [f"Watch Full Videos {emojis[0]}{emojis[1]}\n"]
-                caption_parts.extend([f"V{i}: {link}" for i, link in enumerate(links, 1)])
-                final_caption = "\n".join(caption_parts)
+            # Call the helper function to generate the new caption
+            new_caption = create_beautiful_caption(message.text)
+            if new_caption:
+                final_caption = new_caption
 
         for dest_id_str in dest_ids_str.split(','):
             try: dest_id = int(dest_id_str.strip())
@@ -136,9 +148,10 @@ async def handle_new_message(event):
                 if thumb_path and os.path.exists(thumb_path): os.remove(thumb_path)
 
 # --- TELEGRAM BOT (THE INTERFACE) ---
+# ... (The entire bot interface section is unchanged as it was already correct) ...
 
 SOURCE, DESTINATION, BLACKLIST, WHITELIST, MEDIA_FILTER, USER_FILTER, CAPTION_SETTING, CONFIRMATION = range(8)
-DELETE_TASK = 0 # State for delete conversation
+DELETE_TASK = 0
 
 def start(update: Update, context: CallbackContext) -> None:
     update.message.reply_text("Welcome! Use /newtask, /tasks, and /delete.")
@@ -153,11 +166,7 @@ def new_task_start(update: Update, context: CallbackContext) -> int:
     update.message.reply_text("Let's start. First, define the Source chat.")
     return SOURCE
 
-# ... (All get_* and callback functions for the /newtask flow are unchanged) ...
-# I will include them here for completeness.
-
 def get_chat_id(update, context, key_prefix):
-    # This helper is unchanged
     if update.message.forward_from_chat:
         id_val = update.message.forward_from_chat.id
         title_val = update.message.forward_from_chat.title or "N/A"
@@ -270,7 +279,6 @@ def list_tasks(update: Update, context: CallbackContext) -> None:
     msg = "".join([f"🔹 ID: {t[0]}\n   From: `{t[1]}`\n   To: `{t[2]}`\n   Captions: {'✅' if t[3] else '🚫'}\n\n" for t in tasks])
     update.message.reply_text("Your active tasks:\n\n" + msg, parse_mode='Markdown')
 
-# --- **MISSING FUNCTIONS RESTORED HERE** ---
 def delete_task_start(update: Update, context: CallbackContext) -> int:
     list_tasks(update, context)
     update.message.reply_text("Please send the Task ID you want to delete.")
@@ -295,7 +303,6 @@ def delete_task_confirm(update: Update, context: CallbackContext) -> int:
 def cancel(update: Update, context: CallbackContext) -> int:
     update.message.reply_text('Operation cancelled.', reply_markup=ReplyKeyboardRemove())
     return ConversationHandler.END
-# --- END OF RESTORED FUNCTIONS ---
 
 async def main():
     global MY_ID
@@ -318,7 +325,6 @@ async def main():
         fallbacks=[CommandHandler('cancel', cancel)],
     )
     
-    # --- **DELETE HANDLER ADDED CORRECTLY HERE** ---
     delete_handler = ConversationHandler(
         entry_points=[CommandHandler('delete', delete_task_start)],
         states={
@@ -330,7 +336,7 @@ async def main():
     dp.add_handler(conv_handler)
     dp.add_handler(CommandHandler("start", start))
     dp.add_handler(CommandHandler("tasks", list_tasks))
-    dp.add_handler(delete_handler) # This line was missing
+    dp.add_handler(delete_handler)
     
     updater.start_polling()
     print("Control Bot started...")
