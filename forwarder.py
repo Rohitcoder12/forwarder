@@ -36,10 +36,19 @@ def create_beautiful_caption(original_text):
     link_pattern = r'https?://(?:tera[a-z]+|tinyurl)\.com/\S+'
     links = re.findall(link_pattern, original_text or "")
     if not links: return None
+    
     emojis = random.sample(['😍', '🔥', '❤️', '😈', '💯', '💦', '🔞'], 2)
-    caption_parts = [f"Watch Full Videos {emojis[0]}{emojis[1]}\n"]
-    caption_parts.extend([f"V{i}: {link}" for i, link in enumerate(links, 1)])
-    return "\n".join(caption_parts)
+    
+    # Start with the title, followed by a blank line
+    caption_parts = [f"Watch Full Videos {emojis[0]}{emojis[1]}"]
+    
+    # **THE FIX IS HERE:** Add a newline after the V-number
+    # This puts the link on the line below its label.
+    video_links = [f"V{i}:\n{link}" for i, link in enumerate(links, 1)]
+    caption_parts.extend(video_links)
+    
+    # Join everything with TWO newlines for clean separation
+    return "\n\n".join(caption_parts)
 
 # --- TELETHON CLIENT ENGINE ---
 client = TelegramClient(SESSION_NAME, int(API_ID), API_HASH)
