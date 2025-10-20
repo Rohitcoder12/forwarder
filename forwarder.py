@@ -9,7 +9,6 @@ from telegram.ext import (Updater, CommandHandler, MessageHandler, Filters, Conv
 load_dotenv(); API_ID, API_HASH, BOT_TOKEN = os.getenv('API_ID'), os.getenv('API_HASH'), os.getenv('BOT_TOKEN')
 SESSION_NAME, DB_FILE, MY_ID = 'telegram_forwarder', 'tasks.db', None
 if not all([API_ID, API_HASH, BOT_TOKEN]): raise RuntimeError("API credentials must be set in .env file.")
-EVENT_LOOP = None # NEW: Global variable to hold the main event loop
 
 # --- DATABASE SETUP ---
 def init_db():
@@ -47,7 +46,6 @@ client = TelegramClient(SESSION_NAME, int(API_ID), API_HASH)
 @client.on(events.NewMessage())
 async def handle_new_message(event):
     if not MY_ID: return
-    # ... (This entire function is unchanged and correct) ...
     message = event.message; conn = sqlite3.connect(DB_FILE); cursor = conn.cursor()
     cursor.execute("SELECT * FROM tasks WHERE source_id = ?", (event.chat_id,)); tasks = cursor.fetchall(); conn.close()
     if not tasks: return
@@ -84,16 +82,16 @@ async def handle_new_message(event):
                 if dl_path and os.path.exists(dl_path): os.remove(dl_path)
                 if thumb_path and os.path.exists(thumb_path): os.remove(thumb_path)
 
-
 # --- TELEGRAM BOT INTERFACE ---
 (SOURCE, DESTINATION, BLACKLIST, WHITELIST, MEDIA_FILTER, USER_FILTER, 
  CAPTION_SETTING, FOOTER_SETTING, CONFIRMATION, DELETE_TASK) = range(10)
 
-def start(update: Update, context: CallbackContext): update.message.reply_text("Bot is running. Use /help to see all available commands.")
+def start(update: Update, context: CallbackContext): update.message.reply_text("Bot is running. Use /help to see available commands.")
+def cancel(update: Update, context: CallbackContext): update.message.reply_text("Operation cancelled."); return ConversationHandler.END
 
 def help_command(update: Update, context: CallbackContext):
     help_text = """
-    **Welcome to your Advanced Forwarder & Downloader Bot!**
+    **Welcome to your Advanced Auto-Forwarder Bot!**
 
     Here are the available commands and features:
 
@@ -110,22 +108,16 @@ def help_command(update: Update, context: CallbackContext):
     - **Beautiful Captions:** Automatically reformat posts containing Tera-links.
     - **Custom Footer:** Add a standard footer text to all messages for a specific task.
 
-    **DOWNLOADER TOOL**
-    `/fetch <link>` - Downloads a single post from a private channel link.
-    `/fetch <start_link> <end_link>` - Downloads a range of posts between two links.
-
     **GENERAL**
-    `/cancel` - Cancels any ongoing setup process.
+    `/cancel` - Cancels any ongoing setup process (`/newtask` or `/delete`).
     `/help` - Shows this help message.
     """
     update.message.reply_text(help_text, parse_mode='Markdown')
 
-def cancel(update: Update, context: CallbackContext): update.message.reply_text("Operation cancelled."); return ConversationHandler.END
-
-# ... (All /newtask setup functions are here and unchanged) ...
 def new_task_start(update: Update, context: CallbackContext) -> int:
     context.user_data.clear(); context.user_data.update({'media_filters': {'photos': False, 'videos': False, 'documents': False, 'text': False}, 'user_filters': {'replies': False, 'own': False}, 'beautiful_captions': False, 'footer': None})
     update.message.reply_text("Let's configure a forwarder. First, define the Source chat."); return SOURCE
+
 def get_chat_id(update, context, key_prefix):
     if update.message.forward_from_chat:
         id_val, title_val = update.message.forward_from_chat.id, update.message.forward_from_chat.title or "N/A"
@@ -205,56 +197,9 @@ def delete_task_confirm(update: Update, context: CallbackContext) -> int:
     except ValueError: update.message.reply_text("Invalid ID.")
     return ConversationHandler.END
 
-# --- /fetch COMMAND FUNCTIONS (CORRECTED) ---
-async def fetch_command_async(update: Update, context: CallbackContext):
-    update.message.reply_text("Processing your link(s)...")
-    try:
-        links = context.args
-        if not links: update.message.reply_text("Usage: /fetch <link1> [link2]"); return
-        chat_id_pattern = r't\.me/c/(\d+)/(\d+)'; match1 = re.search(chat_id_pattern, links[0])
-        if not match1: update.message.reply_text("Invalid private link format."); return
-        chat_id, start_id = int(match1.group(1)), int(match1.group(2)); end_id = start_id
-        if len(links) > 1:
-            match2 = re.search(chat_id_pattern, links[1])
-            if match2 and int(match2.group(1)) == chat_id:
-                id2 = int(match2.group(2)); start_id, end_id = min(start_id, id2), max(start_id, id2)
-        
-        message_ids = range(start_id, end_id + 1)
-        update.message.reply_text(f"Fetching {len(message_ids)} message(s) from chat `{-100 * chat_id}`...", parse_mode='Markdown')
-        messages = await client.get_messages(-100 * chat_id, ids=list(message_ids))
-        count = 0
-        for msg in messages:
-            if not msg: continue
-            count += 1; dl_path, thumb_path = None, None
-            try:
-                if msg.media:
-                    dl_path = await msg.download_media()
-                    with open(dl_path, 'rb') as f:
-                        thumb_io = None
-                        if msg.video:
-                            thumb_path = await generate_thumbnail(dl_path)
-                            if thumb_path: thumb_io = open(thumb_path, 'rb')
-                        context.bot.send_document(chat_id=update.effective_chat.id, document=f, caption=msg.text, thumb=thumb_io)
-                        if thumb_io: thumb_io.close()
-                elif msg.text: context.bot.send_message(chat_id=update.effective_chat.id, text=msg.text)
-            finally:
-                if dl_path and os.path.exists(dl_path): os.remove(dl_path)
-                if thumb_path and os.path.exists(thumb_path): os.remove(thumb_path)
-        update.message.reply_text(f"✅ Fetch complete. Sent {count} message(s).")
-    except Exception as e: update.message.reply_text(f"An error occurred: {e}")
-
-def fetch_command_sync(update: Update, context: CallbackContext):
-    # **THE FIX IS HERE: We schedule the async task on the main loop instead of creating a new one.**
-    if EVENT_LOOP:
-        asyncio.run_coroutine_threadsafe(fetch_command_async(update, context), EVENT_LOOP)
-    else:
-        update.message.reply_text("Error: Event loop not available. Please try again in a moment.")
-
 # --- MAIN EXECUTION BLOCK ---
 async def main():
-    global MY_ID, EVENT_LOOP
-    EVENT_LOOP = asyncio.get_running_loop() # Get the main event loop
-    init_db(); updater = Updater(BOT_TOKEN); dp = updater.dispatcher
+    global MY_ID; init_db(); updater = Updater(BOT_TOKEN); dp = updater.dispatcher
     
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler('newtask', new_task_start)],
@@ -271,7 +216,6 @@ async def main():
     dp.add_handler(conv_handler); dp.add_handler(delete_handler)
     dp.add_handler(CommandHandler("start", start)); dp.add_handler(CommandHandler("tasks", list_tasks))
     dp.add_handler(CommandHandler("help", help_command))
-    dp.add_handler(CommandHandler("fetch", fetch_command_sync))
     
     updater.start_polling(); print("Control Bot started...")
     await client.start()
