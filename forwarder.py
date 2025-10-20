@@ -38,6 +38,7 @@ def create_beautiful_caption(original_text):
     if not links: return None
     emojis = random.sample(['😍', '🔥', '❤️', '😈', '💯', '💦', '🔞'], 2)
     caption_parts = [f"Watch Full Videos {emojis[0]}{emojis[1]}\n"]
+    # FIX: Ensure each link is on a new line
     caption_parts.extend([f"V{i}: {link}" for i, link in enumerate(links, 1)])
     return "\n".join(caption_parts)
 
@@ -89,10 +90,11 @@ async def handle_new_message(event):
 def start(update: Update, context: CallbackContext): update.message.reply_text("Bot is running. Use /newtask for forwarding or /fetch for downloading.")
 def cancel(update: Update, context: CallbackContext): update.message.reply_text("Operation cancelled."); return ConversationHandler.END
 
+# ... (All /newtask setup functions are here and unchanged) ...
 def new_task_start(update: Update, context: CallbackContext) -> int:
     context.user_data.clear(); context.user_data.update({'media_filters': {'photos': False, 'videos': False, 'documents': False, 'text': False}, 'user_filters': {'replies': False, 'own': False}, 'beautiful_captions': False, 'footer': None})
     update.message.reply_text("Let's configure a forwarder. First, define the Source chat."); return SOURCE
-# ... (get_chat_id, get_source, get_destination, get_blacklist, get_whitelist are unchanged) ...
+
 def get_chat_id(update, context, key_prefix):
     if update.message.forward_from_chat:
         id_val, title_val = update.message.forward_from_chat.id, update.message.forward_from_chat.title or "N/A"
@@ -120,8 +122,8 @@ def get_whitelist(update: Update, context: CallbackContext) -> int:
     context.user_data['whitelist'] = None if update.message.text.lower() == '/skip' else update.message.text
     ud = context.user_data['media_filters']; keyboard = [[InlineKeyboardButton(f"{'🚫' if ud[k] else '✅'} {k.capitalize()}", callback_data=f'media_{k}') for k in ud], [InlineKeyboardButton("➡️ Done", callback_data='media_done')]]
     update.message.reply_text("✅ Whitelist set. Configure media to block (🚫=BLOCK).", reply_markup=InlineKeyboardMarkup(keyboard)); return MEDIA_FILTER
-# ... (media_filter_callback and user_filter_callback are unchanged, they just transition to a new state) ...
-def build_user_filter_menu(context: CallbackContext): # Unchanged helper
+
+def build_user_filter_menu(context: CallbackContext):
     ud = context.user_data['user_filters']
     keyboard = [[InlineKeyboardButton(f"{'🚫' if ud['replies'] else '✅'} Replies to Me", callback_data='user_replies'), InlineKeyboardButton(f"{'🚫' if ud['own'] else '✅'} My Msgs", callback_data='user_own')], [InlineKeyboardButton("➡️ Done", callback_data='user_done')]]
     return InlineKeyboardMarkup(keyboard)
@@ -166,28 +168,39 @@ def save_task(update: Update, context: CallbackContext) -> int:
     conn.commit(); conn.close()
     update.message.reply_text("✅ Task saved successfully!", reply_markup=ReplyKeyboardRemove()); return ConversationHandler.END
 
-def list_tasks(update: Update, context: CallbackContext): # Unchanged
-    #...
-    pass
-def delete_task_start(update: Update, context: CallbackContext): # Unchanged
-    #...
-    pass
-def delete_task_confirm(update: Update, context: CallbackContext): # Unchanged
-    #...
-    pass
+def list_tasks(update: Update, context: CallbackContext):
+    conn = sqlite3.connect(DB_FILE); cursor = conn.cursor()
+    cursor.execute("SELECT id, source_id, destination_ids, beautiful_captions FROM tasks"); tasks = cursor.fetchall(); conn.close()
+    if not tasks: update.message.reply_text("No active tasks."); return
+    msg = "".join([f"🔹 ID: {t[0]}\n   From: `{t[1]}`\n   To: `{t[2]}`\n   Captions: {'✅' if t[3] else '🚫'}\n\n" for t in tasks])
+    update.message.reply_text("Your active tasks:\n\n" + msg, parse_mode='Markdown')
 
-# --- NEW: /fetch COMMAND FUNCTIONS ---
+def delete_task_start(update: Update, context: CallbackContext) -> int:
+    list_tasks(update, context); update.message.reply_text("Please send the Task ID to delete."); return DELETE_TASK
+
+def delete_task_confirm(update: Update, context: CallbackContext) -> int:
+    try:
+        task_id = int(update.message.text); conn = sqlite3.connect(DB_FILE); cursor = conn.cursor()
+        cursor.execute("DELETE FROM tasks WHERE id = ?", (task_id,)); conn.commit()
+        if cursor.rowcount > 0: update.message.reply_text(f"✅ Task {task_id} deleted.")
+        else: update.message.reply_text(f"❌ Task {task_id} not found.")
+        conn.close()
+    except ValueError: update.message.reply_text("Invalid ID.")
+    return ConversationHandler.END
+
+# --- /fetch COMMAND FUNCTIONS (CORRECTED) ---
 async def fetch_command_async(update: Update, context: CallbackContext):
-    await update.message.reply_text("Processing your link(s)...")
+    # **THE FIX IS HERE: `await` is removed from all `python-telegram-bot` calls.**
+    update.message.reply_text("Processing your link(s)...")
     try:
         links = context.args
         if not links:
-            await update.message.reply_text("Usage: /fetch <link1> [link2]"); return
+            update.message.reply_text("Usage: /fetch <link1> [link2]"); return
 
         chat_id_pattern = r't\.me/c/(\d+)/(\d+)'
         match1 = re.search(chat_id_pattern, links[0])
         if not match1:
-            await update.message.reply_text("Invalid private link format."); return
+            update.message.reply_text("Invalid private link format."); return
         
         chat_id = int(match1.group(1))
         start_id = int(match1.group(2))
@@ -200,7 +213,7 @@ async def fetch_command_async(update: Update, context: CallbackContext):
                 start_id, end_id = min(start_id, id2), max(start_id, id2)
         
         message_ids = range(start_id, end_id + 1)
-        await update.message.reply_text(f"Fetching {len(message_ids)} message(s) from chat {chat_id}...")
+        update.message.reply_text(f"Fetching {len(message_ids)} message(s) from chat `{-100 * chat_id}`...", parse_mode='Markdown')
 
         messages = await client.get_messages(-100 * chat_id, ids=list(message_ids))
         
@@ -210,17 +223,25 @@ async def fetch_command_async(update: Update, context: CallbackContext):
             try:
                 if msg.media:
                     dl_path = await msg.download_media()
-                    if msg.video: thumb_path = await generate_thumbnail(dl_path)
-                    await context.bot.send_document(chat_id=update.effective_chat.id, document=open(dl_path, 'rb'), caption=msg.text, thumb=open(thumb_path, 'rb') if thumb_path else None)
+                    # We can't use await context.bot.send_document, so we have to do it this way
+                    with open(dl_path, 'rb') as f:
+                        thumb_io = None
+                        if msg.video:
+                            thumb_path = await generate_thumbnail(dl_path)
+                            if thumb_path:
+                                thumb_io = open(thumb_path, 'rb')
+                        context.bot.send_document(chat_id=update.effective_chat.id, document=f, caption=msg.text, thumb=thumb_io)
+                        if thumb_io:
+                            thumb_io.close()
                 elif msg.text:
-                    await context.bot.send_message(chat_id=update.effective_chat.id, text=msg.text)
+                    context.bot.send_message(chat_id=update.effective_chat.id, text=msg.text)
             finally:
                 if dl_path and os.path.exists(dl_path): os.remove(dl_path)
                 if thumb_path and os.path.exists(thumb_path): os.remove(thumb_path)
-        await update.message.reply_text("✅ Fetch complete.")
+        update.message.reply_text("✅ Fetch complete.")
 
     except Exception as e:
-        await update.message.reply_text(f"An error occurred: {e}")
+        update.message.reply_text(f"An error occurred: {e}")
 
 def fetch_command_sync(update: Update, context: CallbackContext):
     asyncio.run(fetch_command_async(update, context))
@@ -232,13 +253,10 @@ async def main():
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler('newtask', new_task_start)],
         states={
-            SOURCE: [MessageHandler(Filters.all & ~Filters.command, get_source)],
-            DESTINATION: [MessageHandler(Filters.text & ~Filters.command, get_destination)],
+            SOURCE: [MessageHandler(Filters.all & ~Filters.command, get_source)], DESTINATION: [MessageHandler(Filters.text & ~Filters.command, get_destination)],
             BLACKLIST: [MessageHandler(Filters.text, get_blacklist)], WHITELIST: [MessageHandler(Filters.text, get_whitelist)],
-            MEDIA_FILTER: [CallbackQueryHandler(media_filter_callback, pattern='^media_')],
-            USER_FILTER: [CallbackQueryHandler(user_filter_callback, pattern='^user_')],
-            CAPTION_SETTING: [CallbackQueryHandler(caption_setting_callback, pattern='^caption_')],
-            FOOTER_SETTING: [MessageHandler(Filters.text, get_footer)],
+            MEDIA_FILTER: [CallbackQueryHandler(media_filter_callback, pattern='^media_')], USER_FILTER: [CallbackQueryHandler(user_filter_callback, pattern='^user_')],
+            CAPTION_SETTING: [CallbackQueryHandler(caption_setting_callback, pattern='^caption_')], FOOTER_SETTING: [MessageHandler(Filters.text, get_footer)],
             CONFIRMATION: [MessageHandler(Filters.regex('^(Confirm|Cancel)$'), save_task)],
         }, fallbacks=[CommandHandler('cancel', cancel)]
     )
