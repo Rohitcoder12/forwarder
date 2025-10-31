@@ -62,12 +62,14 @@ async def handle_new_message(event):
         if wl and not any(w.strip() in full_text for w in wl.lower().split(',')): continue
         if bl and any(w.strip() in full_text for w in bl.lower().split(',')): continue
         
-        # --- **THE FIX IS HERE: The order of operations is corrected** ---
         final_caption = message.text
         
-        # 1. Apply Remove Rules FIRST
+        # --- **THE FIX IS HERE: Correct Order of Operations & Correct Logic** ---
+        # 1. Apply Remove Rules FIRST, line by line
         if remove and final_caption:
-            final_caption = final_caption.replace(remove, "")
+            for text_to_remove in remove.splitlines():
+                if text_to_remove: # Ensure the line is not empty
+                    final_caption = final_caption.replace(text_to_remove, "")
         
         # 2. Apply Replace Rules SECOND
         if replace and final_caption:
@@ -76,9 +78,9 @@ async def handle_new_message(event):
                     find, repl = rule.split('=>', 1)
                     final_caption = final_caption.replace(find.strip(), repl.strip())
         
-        # 3. Apply Beautiful Captioning THIRD (it overwrites everything if links are found)
+        # 3. Apply Beautiful Captioning THIRD
         if beautify:
-            new_caption = create_beautiful_caption(final_caption) # Operate on the cleaned caption
+            new_caption = create_beautiful_caption(final_caption)
             if new_caption: final_caption = new_caption
         
         # 4. Apply Footer LAST
@@ -104,7 +106,7 @@ async def handle_new_message(event):
 (SOURCE, DESTINATION, BLACKLIST, WHITELIST, MEDIA_FILTER, USER_FILTER, 
  CAPTION_SETTING, FOOTER_SETTING, REMOVE_SETTING, REPLACE_SETTING, CONFIRMATION, DELETE_TASK) = range(12)
 
-# ... (The entire bot interface section from the previous version is unchanged and correct) ...
+# ... (The entire bot interface section is unchanged and correct) ...
 def start(update: Update, context: CallbackContext): update.message.reply_text("Bot is running. Use /help to see commands.")
 def cancel(update: Update, context: CallbackContext): update.message.reply_text("Operation cancelled."); return ConversationHandler.END
 def help_command(update: Update, context: CallbackContext):
