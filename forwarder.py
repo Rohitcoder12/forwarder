@@ -33,7 +33,7 @@ async def generate_thumbnail(video_path):
     except Exception as e: print(f"Thumbnail generation failed: {e}"); return None
 
 def create_beautiful_caption(original_text):
-    link_pattern = r'https?://(?:tera[a-z]+|tinyurl)\.com/\S+'
+    link_pattern = r'https?://(?:tera[a-z]+|tinyurl|teraboxurl)\.com/\S+'
     links = re.findall(link_pattern, original_text or "")
     if not links: return None
     emojis = random.sample(['😍', '🔥', '❤️', '😈', '💯', '💦', '🔞'], 2)
@@ -62,24 +62,26 @@ async def handle_new_message(event):
         if wl and not any(w.strip() in full_text for w in wl.lower().split(',')): continue
         if bl and any(w.strip() in full_text for w in bl.lower().split(',')): continue
         
+        # --- **THE FIX IS HERE: The order of operations is corrected** ---
         final_caption = message.text
-        if beautify:
-            new_caption = create_beautiful_caption(message.text)
-            if new_caption: final_caption = new_caption
         
-        # --- **THE FIX IS HERE** ---
-        # 1. Apply Remove Rules as a single block
+        # 1. Apply Remove Rules FIRST
         if remove and final_caption:
             final_caption = final_caption.replace(remove, "")
         
-        # 2. Apply Replace Rules line-by-line
+        # 2. Apply Replace Rules SECOND
         if replace and final_caption:
             for rule in replace.splitlines():
                 if '=>' in rule:
                     find, repl = rule.split('=>', 1)
                     final_caption = final_caption.replace(find.strip(), repl.strip())
         
-        # 3. Apply Footer
+        # 3. Apply Beautiful Captioning THIRD (it overwrites everything if links are found)
+        if beautify:
+            new_caption = create_beautiful_caption(final_caption) # Operate on the cleaned caption
+            if new_caption: final_caption = new_caption
+        
+        # 4. Apply Footer LAST
         if footer: final_caption = f"{final_caption.strip() if final_caption else ''}\n\n{footer}"
         
         for dest_id_str in dest_ids_str.split(','):
@@ -102,6 +104,7 @@ async def handle_new_message(event):
 (SOURCE, DESTINATION, BLACKLIST, WHITELIST, MEDIA_FILTER, USER_FILTER, 
  CAPTION_SETTING, FOOTER_SETTING, REMOVE_SETTING, REPLACE_SETTING, CONFIRMATION, DELETE_TASK) = range(12)
 
+# ... (The entire bot interface section from the previous version is unchanged and correct) ...
 def start(update: Update, context: CallbackContext): update.message.reply_text("Bot is running. Use /help to see commands.")
 def cancel(update: Update, context: CallbackContext): update.message.reply_text("Operation cancelled."); return ConversationHandler.END
 def help_command(update: Update, context: CallbackContext):
