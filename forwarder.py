@@ -51,7 +51,6 @@ async def handle_new_message(event):
     if not tasks: return
     for task in tasks:
         _, _, dest_ids_str, bl, wl, no_p, no_v, no_d, no_t, no_r, no_m, beautify, footer, remove, replace = task
-        # ... (All previous filters are here and unchanged) ...
         if (no_m and message.sender_id == MY_ID) or (no_p and message.photo) or (no_v and message.video) or \
            (no_d and message.document and not message.video) or (no_t and message.text and not message.media): continue
         if no_r and message.is_reply:
@@ -63,18 +62,17 @@ async def handle_new_message(event):
         if wl and not any(w.strip() in full_text for w in wl.lower().split(',')): continue
         if bl and any(w.strip() in full_text for w in bl.lower().split(',')): continue
         
-        # --- NEW: TEXT MANIPULATION ENGINE ---
         final_caption = message.text
         if beautify:
             new_caption = create_beautiful_caption(message.text)
             if new_caption: final_caption = new_caption
         
-        # 1. Apply Remove Rules
+        # --- **THE FIX IS HERE** ---
+        # 1. Apply Remove Rules as a single block
         if remove and final_caption:
-            for text_to_remove in remove.splitlines():
-                if text_to_remove: final_caption = final_caption.replace(text_to_remove, "")
+            final_caption = final_caption.replace(remove, "")
         
-        # 2. Apply Replace Rules
+        # 2. Apply Replace Rules line-by-line
         if replace and final_caption:
             for rule in replace.splitlines():
                 if '=>' in rule:
@@ -84,7 +82,6 @@ async def handle_new_message(event):
         # 3. Apply Footer
         if footer: final_caption = f"{final_caption.strip() if final_caption else ''}\n\n{footer}"
         
-        # ... (Rest of the forwarding logic is unchanged) ...
         for dest_id_str in dest_ids_str.split(','):
             try: dest_id = int(dest_id_str.strip())
             except ValueError: continue
@@ -105,7 +102,6 @@ async def handle_new_message(event):
 (SOURCE, DESTINATION, BLACKLIST, WHITELIST, MEDIA_FILTER, USER_FILTER, 
  CAPTION_SETTING, FOOTER_SETTING, REMOVE_SETTING, REPLACE_SETTING, CONFIRMATION, DELETE_TASK) = range(12)
 
-# ... (All setup functions are here, with new ones added for Remove/Replace) ...
 def start(update: Update, context: CallbackContext): update.message.reply_text("Bot is running. Use /help to see commands.")
 def cancel(update: Update, context: CallbackContext): update.message.reply_text("Operation cancelled."); return ConversationHandler.END
 def help_command(update: Update, context: CallbackContext):
@@ -116,15 +112,13 @@ def help_command(update: Update, context: CallbackContext):
     `/cancel` - Cancel any setup process.
     `/help` - Shows this message.
     
-    **New Features in `/newtask`:**
-    - **Remove Text:** Provide text (one phrase per line) to be deleted from captions.
-    - **Replace Text:** Provide rules like `find this => replace with this` (one rule per line) to modify captions."""
+    **Features in `/newtask`:**
+    - **Remove Text:** Provide text (multi-line supported) to be deleted from captions.
+    - **Replace Text:** Provide rules like `find => replace` (one rule per line) to modify captions."""
     update.message.reply_text(help_text, parse_mode='Markdown')
-
 def new_task_start(update: Update, context: CallbackContext) -> int:
     context.user_data.clear(); context.user_data.update({'media_filters': {}, 'user_filters': {}, 'beautiful_captions': False, 'footer': None, 'remove': None, 'replace': None})
     update.message.reply_text("Let's configure a forwarder. First, define the Source chat."); return SOURCE
-
 def get_chat_id(update, context, key_prefix):
     if update.message.forward_from_chat:
         id_val, title_val = update.message.forward_from_chat.id, update.message.forward_from_chat.title or "N/A"
@@ -186,7 +180,7 @@ def get_replace_rules(update: Update, context: CallbackContext) -> int:
     update.message.reply_text(summary, parse_mode='Markdown', reply_markup=ReplyKeyboardMarkup([['Confirm', 'Cancel']], one_time_keyboard=True)); return CONFIRMATION
 def save_task(update: Update, context: CallbackContext) -> int:
     if update.message.text.lower() != 'confirm': return cancel(update, context)
-    ud, mf, uf = context.user_data, context.user_data['media_filters'], context.user_data['user_filters']
+    ud, mf, uf = context.user_data, context.user_data.get('media_filters',{}), context.user_data.get('user_filters',{})
     conn = sqlite3.connect(DB_FILE); cursor = conn.cursor()
     cursor.execute("INSERT INTO tasks (source_id, destination_ids, blacklist_words, whitelist_words, block_photos, block_videos, block_documents, block_text, block_replies_to_me, block_my_messages, beautiful_captions, footer_text, remove_texts, replace_rules) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                    (int(ud['source_ids']), ud['destination_ids'], ud.get('blacklist'), ud.get('whitelist'), mf.get('photos',0), mf.get('videos',0), mf.get('documents',0), mf.get('text',0), uf.get('replies',0), uf.get('own',0), ud.get('beautiful_captions',0), ud.get('footer'), ud.get('remove'), ud.get('replace')))
