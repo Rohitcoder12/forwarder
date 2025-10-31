@@ -58,19 +58,17 @@ async def handle_new_message(event):
                 r_msg = await message.get_reply_message()
                 if r_msg and r_msg.sender_id == MY_ID: continue
             except: pass
-        full_text = (message.text or "").lower()
-        if wl and not any(w.strip() in full_text for w in wl.lower().split(',')): continue
-        if bl and any(w.strip() in full_text for w in bl.lower().split(',')): continue
         
         final_caption = message.text
         
-        # --- **THE FIX IS HERE: Correct Order of Operations & Correct Logic** ---
-        # 1. Apply Remove Rules FIRST, line by line
+        # --- **THE FINAL, ROBUST FIX IS HERE** ---
+        # 1. Apply Remove Rules FIRST, line by line comparison
         if remove and final_caption:
-            for text_to_remove in remove.splitlines():
-                if text_to_remove: # Ensure the line is not empty
-                    final_caption = final_caption.replace(text_to_remove, "")
-        
+            lines_to_remove = {line.strip() for line in remove.splitlines() if line.strip()}
+            original_lines = final_caption.splitlines()
+            kept_lines = [line for line in original_lines if line.strip() not in lines_to_remove]
+            final_caption = "\n".join(kept_lines)
+
         # 2. Apply Replace Rules SECOND
         if replace and final_caption:
             for rule in replace.splitlines():
