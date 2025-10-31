@@ -81,14 +81,14 @@ async def handle_new_message(event):
             new_caption = create_beautiful_caption(final_caption)
             if new_caption: final_caption = new_caption
         
-        # 4. Clean up excess blank lines and Apply Footer LAST
+        # 4. Smart Cleanup and Footer Application
         if final_caption:
-            # Re-split and join to remove blank lines left from the removal process
-            cleaned_lines = [line for line in final_caption.splitlines() if line.strip()]
-            final_caption = "\n".join(cleaned_lines)
+            # Collapse multiple (3+) newlines into just two, preserving single blank lines
+            final_caption = re.sub(r'\n{3,}', '\n\n', final_caption).strip()
         
         if footer:
-            final_caption = f"{final_caption}\n\n{footer}"
+            # Add footer with a clean double newline separator
+            final_caption = f"{final_caption or ''}\n\n{footer}"
         
         for dest_id_str in dest_ids_str.split(','):
             try: dest_id = int(dest_id_str.strip())
