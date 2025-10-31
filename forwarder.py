@@ -61,7 +61,7 @@ async def handle_new_message(event):
         
         final_caption = message.text
         
-        # --- **THE FINAL, ROBUST FIX IS HERE** ---
+        # --- **THE FINAL, CORRECTED LOGIC** ---
         # 1. Apply Remove Rules FIRST, line by line comparison
         if remove and final_caption:
             lines_to_remove = {line.strip() for line in remove.splitlines() if line.strip()}
@@ -81,8 +81,14 @@ async def handle_new_message(event):
             new_caption = create_beautiful_caption(final_caption)
             if new_caption: final_caption = new_caption
         
-        # 4. Apply Footer LAST
-        if footer: final_caption = f"{final_caption.strip() if final_caption else ''}\n\n{footer}"
+        # 4. Clean up excess blank lines and Apply Footer LAST
+        if final_caption:
+            # Re-split and join to remove blank lines left from the removal process
+            cleaned_lines = [line for line in final_caption.splitlines() if line.strip()]
+            final_caption = "\n".join(cleaned_lines)
+        
+        if footer:
+            final_caption = f"{final_caption}\n\n{footer}"
         
         for dest_id_str in dest_ids_str.split(','):
             try: dest_id = int(dest_id_str.strip())
