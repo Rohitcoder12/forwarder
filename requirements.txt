@@ -7,3 +7,10 @@ python-telegram-bot==13.7
 
 # For loading secret credentials from the .env file
 python-dotenv
+
+# For video thumbnail generation (provides 'cv2')
+# Use the headless version for servers
+opencv-python-headless
+
+# For image manipulation (used by thumbnail generation)
+Pillow
