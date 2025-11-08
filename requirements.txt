@@ -1,16 +1,6 @@
-# For the user account client (Telethon)
 telethon
-
-# For the control bot interface (python-telegram-bot)
-# Version 13.7 is specified for compatibility with the provided code.
 python-telegram-bot==13.7
-
-# For loading secret credentials from the .env file
 python-dotenv
-
-# For video thumbnail generation (provides 'cv2')
-# Use the headless version for servers
 opencv-python-headless
-
-# For image manipulation (used by thumbnail generation)
 Pillow
+pymongo[srv]
