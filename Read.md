@@ -159,8 +159,8 @@ We will use `systemd` to keep the bot running forever.
     [Service]
     User=yourusername
     Group=yourusername
-    WorkingDirectory=/home/yourusername/YourRepoName
-    ExecStart=/home/yourusername/YourRepoName/venv/bin/python /home/yourusername/YourRepoName/forwarder.py
+    WorkingDirectory=/yourusername/YourRepoName
+    ExecStart=/yourusername/YourRepoName/venv/bin/python /yourusername/YourRepoName/forwarder.py
     Restart=always
     RestartSec=10
 
