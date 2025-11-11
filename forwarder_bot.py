@@ -58,6 +58,18 @@ def parse_chat_ids(text: str) -> list[int] | None:
     except (ValueError, TypeError):
         return None
 
+# --- FEATURE ADDED BACK ---
+def create_beautiful_caption(original_text):
+    link_pattern = r'https?://(?:tera[a-z]+|tinyurl|teraboxurl|freeterabox)\.com/\S+'
+    links = re.findall(link_pattern, original_text or "")
+    if not links:
+        return None # Return None if no links are found, so original caption is kept
+    emojis = random.sample(['😍', '🔥', '❤️', '😈', '💯', '💦', '🔞'], 2)
+    caption_parts = [f"Watch Full Videos {emojis[0]}{emojis[1]}"]
+    video_links = [f"V{i}:\n{link}" for i, link in enumerate(links, 1)]
+    caption_parts.extend(video_links)
+    return "\n\n".join(caption_parts)
+
 async def resend_message(destination_id: int, message: Message, caption: str | None):
     dl_path, thumb_path = None, None
     try:
@@ -69,9 +81,8 @@ async def resend_message(destination_id: int, message: Message, caption: str | N
                 with open(temp_file_for_thumb, "wb") as f: f.write(dl_path)
                 thumb_path = await generate_thumbnail(temp_file_for_thumb)
                 if os.path.exists(temp_file_for_thumb): os.remove(temp_file_for_thumb)
-
             await client.send_file(destination_id, dl_path, caption=caption, thumb=thumb_path)
-        elif message.text:
+        elif message.text and caption: # Ensure we only send if there's text
             await client.send_message(destination_id, caption)
         return True
     except Exception as e:
@@ -84,13 +95,12 @@ async def resend_message(destination_id: int, message: Message, caption: str | N
 async def generate_thumbnail(video_path):
     try:
         thumb_path = os.path.splitext(video_path)[0] + ".jpg"
-        cap = cv2.VideoCapture(video_path)
+        cap = cv2.VideoCapture(video_path);
         if not cap.isOpened(): return None
         ret, frame = cap.read();
         if not ret:
             cap.release(); return None
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        img = Image.fromarray(frame_rgb)
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB); img = Image.fromarray(frame_rgb)
         img.thumbnail((320, 320)); img.save(thumb_path, "JPEG"); cap.release(); return thumb_path
     except Exception as e:
         LOGGER.error(f"Thumbnail generation failed: {e}"); return None
@@ -106,6 +116,7 @@ async def handle_new_message(event):
     for task in active_tasks:
         mods = task.get("modifications", {})
         final_caption = message.text
+
         if mods.get("remove_texts") and final_caption:
             lines_to_remove = {line.strip() for line in mods["remove_texts"].splitlines() if line.strip()}
             kept_lines = [line for line in final_caption.splitlines() if line.strip() not in lines_to_remove]
@@ -114,21 +125,29 @@ async def handle_new_message(event):
             for rule in mods["replace_rules"].splitlines():
                 if '=>' in rule:
                     find, repl = rule.split('=>', 1); final_caption = final_caption.replace(find.strip(), repl.strip())
+        
+        # --- FEATURE ADDED BACK ---
+        if mods.get("beautiful_captions"):
+            new_caption = create_beautiful_caption(final_caption)
+            if new_caption: # Only replace caption if links were found and new caption was generated
+                final_caption = new_caption
+
         if final_caption:
             final_caption = re.sub(r'\n{3,}', '\n\n', final_caption).strip()
         if mods.get("footer_text"):
             final_caption = f"{final_caption or ''}\n\n{mods['footer_text']}"
+        
         for dest_id in task.get("destination_ids", []):
-            LOGGER.info(f"Forwarding message {message.id} from task '{task['_id']}' to {dest_id}")
+            LOGGER.info(f"Copying message {message.id} from task '{task['_id']}' to {dest_id}")
             await resend_message(dest_id, message, final_caption)
             delay = task.get("settings", {}).get("delay", 0)
             if delay > 0: await asyncio.sleep(delay)
 
-# --- TELEGRAM BOT INTERFACE (python-telegram-bot v20+) ---
+# --- TELEGRAM BOT INTERFACE ---
 (ASK_LABEL, ASK_SOURCE, ASK_DESTINATION, ASK_FOOTER, ASK_REPLACE, ASK_REMOVE) = range(6)
 (MAIN_MENU, SETTINGS_MENU, GET_LINKS, GET_BATCH_DESTINATION) = range(6, 10)
 
-async def forward_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def forward_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, from_cancel=False):
     user_id = update.effective_user.id
     tasks = list(tasks_collection.find({"owner_id": user_id}))
     buttons = [[InlineKeyboardButton(f"{'✅' if t.get('status') == 'active' else '❌'} {t['_id']}", callback_data=f"toggle_status:{t['_id']}"),
@@ -136,46 +155,35 @@ async def forward_command_handler(update: Update, context: ContextTypes.DEFAULT_
                 InlineKeyboardButton("🗑️", callback_data=f"delete_confirm:{t['_id']}")] for t in tasks]
     keyboard = InlineKeyboardMarkup([*buttons, [InlineKeyboardButton("➕ Create New Task", callback_data="new_task_start")]])
     text = "Your Forwarding Tasks:" if tasks else "You have no tasks. Create one!"
-    if update.callback_query: await update.callback_query.edit_message_text(text, reply_markup=keyboard)
-    else: await update.message.reply_text(text, reply_markup=keyboard)
+    
+    if update.callback_query and not from_cancel:
+        await update.callback_query.edit_message_text(text, reply_markup=keyboard)
+    else:
+        await context.bot.send_message(chat_id=update.effective_chat.id, text=text, reply_markup=keyboard)
     return MAIN_MENU
 
 async def save_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("Usage: /save <message_link>"); return
-
-    link = context.args[0]
-    match = re.match(r"https?://t\.me/(c/)?(\w+)/(\d+)", link)
+    link = context.args[0]; match = re.match(r"https?://t\.me/(c/)?(\w+)/(\d+)", link)
     if not match:
         await update.message.reply_text("Invalid message link format."); return
-
     try:
-        # --- FIX #1: CORRECTLY PARSE AND CONVERT THE CHAT ID TO AN INTEGER ---
-        is_private = match.group(1)
-        channel_id_str = match.group(2)
-        if is_private:
-            chat_id = int(f"-100{channel_id_str}")
-        else:
-            chat_id = channel_id_str # Keep as string for public usernames
-        # --- END OF FIX #1 ---
-
+        is_private = match.group(1); channel_id_str = match.group(2)
+        chat_id = int(f"-100{channel_id_str}") if is_private else channel_id_str
         msg_id = int(match.group(3))
         status_msg = await update.message.reply_text("Fetching post...")
         message = await client.get_messages(chat_id, ids=msg_id)
-        
         if not message:
-            await status_msg.edit_text("Could not fetch the message. Make sure the link is correct and I have access."); return
-
+            await status_msg.edit_text("Could not fetch message."); return
         media_content = await message.download_media(file=bytes) if message.media else None
         await status_msg.delete()
-
         if message.photo: await update.message.reply_photo(photo=media_content, caption=message.text)
         elif message.video: await update.message.reply_video(video=media_content, caption=message.text)
         elif message.document: await update.message.reply_document(document=media_content, caption=message.text)
         elif message.text: await update.message.reply_text(message.text)
-            
     except Exception as e:
-        await update.message.reply_text(f"An error occurred: {e}\n\nMake sure your User Account (not the bot) has joined the source channel/group.")
+        await update.message.reply_text(f"An error occurred: {e}\n\nMake sure your User Account has joined the source channel.")
         LOGGER.error(f"Error in /save command: {e}")
 
 async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -199,15 +207,36 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
         return await forward_command_handler(update, context)
     elif query.data == "back_to_main_menu":
         return await forward_command_handler(update, context)
+    
+    # --- FEATURE ADDED BACK: Settings menu logic for Beautiful Captions ---
+    elif action == "settings_toggle_beautify":
+        task = tasks_collection.find_one({"_id": value, "owner_id": user_id})
+        if task:
+            current_status = task.get("modifications", {}).get("beautiful_captions", False)
+            tasks_collection.update_one({"_id": value}, {"$set": {"modifications.beautiful_captions": not current_status}})
+        context.user_data['current_task_id'] = value
+        return await show_settings_menu(update, context) # Refresh menu
+    
     elif action == "settings_menu":
         context.user_data['current_task_id'] = value
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📝 Edit Footer", callback_data="settings_edit_footer")],
-            [InlineKeyboardButton("🔄 Edit Replace Rules", callback_data="settings_edit_replace")],
-            [InlineKeyboardButton("✂️ Edit Remove Texts", callback_data="settings_edit_remove")],
-            [InlineKeyboardButton("⬅️ Back", callback_data="back_to_main_menu")]])
-        await query.edit_message_text(f"Settings for task: *{value}*", reply_markup=keyboard, parse_mode='Markdown')
-        return SETTINGS_MENU
+        return await show_settings_menu(update, context)
+
+async def show_settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    task_id = context.user_data.get('current_task_id')
+    task = tasks_collection.find_one({"_id": task_id})
+    beautify_status = task.get("modifications", {}).get("beautiful_captions", False)
+    beautify_emoji = "✅" if beautify_status else "❌"
+    
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📝 Edit Footer", callback_data="settings_edit_footer")],
+        [InlineKeyboardButton("🔄 Edit Replace Rules", callback_data="settings_edit_replace")],
+        [InlineKeyboardButton("✂️ Edit Remove Texts", callback_data="settings_edit_remove")],
+        [InlineKeyboardButton(f"{beautify_emoji} Toggle Beautiful Captions", callback_data=f"settings_toggle_beautify:{task_id}")],
+        [InlineKeyboardButton("⬅️ Back", callback_data="back_to_main_menu")]])
+    await update.callback_query.edit_message_text(f"Settings for task: *{task_id}*", reply_markup=keyboard, parse_mode='Markdown')
+    return SETTINGS_MENU
+
+# ... (rest of the code is unchanged)
 
 async def new_task_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.callback_query.edit_message_text("Please provide a unique name for this task.\n\nOr /cancel to go back.")
@@ -222,17 +251,19 @@ async def get_label(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def get_source(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     ids = [update.message.forward_origin.chat.id] if update.message.forward_origin else parse_chat_ids(update.message.text)
     if not ids:
-        await update.message.reply_text("Invalid ID format. Please send numeric IDs or forward a message. Or /cancel."); return ASK_SOURCE
+        await update.message.reply_text("Invalid ID. Please send numeric IDs or forward a message. Or /cancel."); return ASK_SOURCE
     context.user_data['new_task_source'] = ids
     await update.message.reply_text("✅ Source(s) set. Now, send the Destination Chat ID(s).\n\nOr /cancel.")
     return ASK_DESTINATION
 async def get_destination(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     ids = [update.message.forward_origin.chat.id] if update.message.forward_origin else parse_chat_ids(update.message.text)
     if not ids:
-        await update.message.reply_text("Invalid ID format. Please send numeric IDs or forward a message. Or /cancel."); return ASK_DESTINATION
+        await update.message.reply_text("Invalid ID. Please send numeric IDs or forward a message. Or /cancel."); return ASK_DESTINATION
+    # --- FEATURE ADDED BACK: Default 'beautiful_captions' to False for new tasks ---
     tasks_collection.insert_one({"_id": context.user_data['new_task_label'], "owner_id": update.effective_user.id, "status": "active",
         "source_ids": context.user_data['new_task_source'], "destination_ids": ids,
-        "modifications": {"footer_text": None, "replace_rules": None, "remove_texts": None}, "settings": {"delay": 0}})
+        "modifications": {"footer_text": None, "replace_rules": None, "remove_texts": None, "beautiful_captions": False}, 
+        "settings": {"delay": 0}})
     context.user_data.clear()
     await update.message.reply_text("✅ Task created successfully!")
     await forward_command_handler(update, context)
@@ -258,10 +289,11 @@ async def save_setting_text(update: Update, context: ContextTypes.DEFAULT_TYPE, 
 async def get_footer(update: Update, context: ContextTypes.DEFAULT_TYPE): return await save_setting_text(update, context, "footer_text")
 async def get_replace_rules(update: Update, context: ContextTypes.DEFAULT_TYPE): return await save_setting_text(update, context, "replace_rules")
 async def get_remove_texts(update: Update, context: ContextTypes.DEFAULT_TYPE): return await save_setting_text(update, context, "remove_texts")
+
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
-    await update.message.reply_text("Operation cancelled.")
-    await forward_command_handler(update, context)
+    await context.bot.send_message(chat_id=update.effective_chat.id, text="Operation cancelled.")
+    await forward_command_handler(update, context, from_cancel=True)
     return ConversationHandler.END
 
 async def batch_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -308,13 +340,15 @@ async def main():
     cancel_handler = CommandHandler('cancel', cancel)
     
     conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("forward", forward_command_handler), CallbackQueryHandler(new_task_start, pattern="^new_task_start$"),
-                      CallbackQueryHandler(callback_query_handler, pattern="^(toggle|delete|back|settings)")],
+        entry_points=[CommandHandler("forward", forward_command_handler), 
+                      CallbackQueryHandler(callback_query_handler, pattern="^(toggle_status|delete_confirm|settings_menu|settings_toggle_beautify)"),
+                      CallbackQueryHandler(new_task_start, pattern="^new_task_start$")],
         states={
             MAIN_MENU: [CallbackQueryHandler(new_task_start, pattern="^new_task_start$"),
-                        CallbackQueryHandler(callback_query_handler, pattern="^(toggle|delete|settings)")],
+                        CallbackQueryHandler(callback_query_handler, pattern="^(toggle_status|delete_confirm|settings_menu|settings_toggle_beautify)")],
             SETTINGS_MENU: [CallbackQueryHandler(edit_setting_ask, pattern="^settings_edit_"),
-                            CallbackQueryHandler(forward_command_handler, pattern="^back_to_main_menu$")],
+                            CallbackQueryHandler(forward_command_handler, pattern="^back_to_main_menu$"),
+                            CallbackQueryHandler(callback_query_handler, pattern="^settings_toggle_beautify")],
             ASK_LABEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_label)],
             ASK_SOURCE: [MessageHandler(filters.ALL & ~filters.COMMAND, get_source)],
             ASK_DESTINATION: [MessageHandler(filters.ALL & ~filters.COMMAND, get_destination)],
@@ -337,14 +371,12 @@ async def main():
     await client.start()
     me = await client.get_me(); MY_ID = me.id; LOGGER.info(f"Telethon client started as: {me.first_name} (ID: {MY_ID})")
     
-    # --- FIX #2: WARM UP CLIENT CACHE ON STARTUP ---
-    LOGGER.info("Warming up Telethon client and fetching dialogs to prevent cache issues...")
+    LOGGER.info("Warming up Telethon client and fetching dialogs...");
     try:
         await client.get_dialogs()
         LOGGER.info("Dialogs fetched successfully.")
     except Exception as e:
         LOGGER.warning(f"Could not pre-fetch dialogs: {e}")
-    # --- END OF FIX #2 ---
 
     await client.run_until_disconnected(); await application.updater.stop(); await application.stop()
 
