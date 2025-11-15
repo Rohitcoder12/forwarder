@@ -6,6 +6,7 @@ import logging
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
 from telethon.tl.types import Message
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -84,7 +85,6 @@ async def handle_new_message(event):
         if final_caption: final_caption = re.sub(r'\n{3,}', '\n\n', final_caption).strip()
         if mods.get("footer_text"): final_caption = f"{final_caption or ''}\n\n{mods['footer_text']}"
         
-        # --- FIX: USE THE DIRECT & RELIABLE COPY METHOD ---
         for dest_id in task.get("destination_ids", []):
             LOGGER.info(f"Copying message {message.id} from task '{task['_id']}' to {dest_id}")
             try:
@@ -123,7 +123,6 @@ async def save_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         message = await client.get_messages(chat_id, ids=msg_id)
         if not message: await status_msg.edit_text("Could not fetch message."); return
         
-        # FIX: Use the direct copy method for the bot to reply
         await client.send_message(update.effective_chat.id, file=message, message=message.text, link_preview=False)
         await status_msg.delete()
     except Exception as e:
@@ -256,7 +255,6 @@ async def get_links(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await update.message.reply_text("Invalid or mismatched links. Or /cancel."); return GET_LINKS
     context.user_data['batch_info'] = {'channel_id': start_channel, 'start_id': start_msg_id, 'end_id': end_msg_id}
     await update.message.reply_text("✅ Links OK. Send destination chat ID.\n\nOr /cancel."); return GET_BATCH_DESTINATION
-
 async def get_batch_destination(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     dest_id = update.message.forward_origin.chat.id if update.message.forward_origin else (parse_chat_ids(update.message.text) or [None])[0]
     if not dest_id: await update.message.reply_text("Invalid destination. Try again or /cancel."); return GET_BATCH_DESTINATION
@@ -270,7 +268,6 @@ async def get_batch_destination(update: Update, context: ContextTypes.DEFAULT_TY
         await status_msg.edit_text(f"Found {total_found} messages. Starting copy process...")
         for i, message in enumerate(existing_messages):
             try:
-                # --- FIX: USE THE DIRECT & RELIABLE COPY METHOD ---
                 await client.send_message(dest_id, file=message, message=message.text, link_preview=False)
                 count += 1
             except Exception as e:
