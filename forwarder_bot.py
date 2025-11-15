@@ -53,6 +53,21 @@ def create_beautiful_caption(original_text):
     caption_parts = [f"Watch Full Videos {emojis[0]}{emojis[1]}"] + [f"V{i}:\n{link}" for i, link in enumerate(links, 1)]
     return "\n\n".join(caption_parts)
 
+# --- NEW: UNIVERSAL DOWNLOAD & RESEND FUNCTION TO BYPASS PROTECTION ---
+async def download_and_resend(destination_id: int, message: Message, caption: str | None) -> bool:
+    """ Downloads media to memory and re-uploads it, bypassing all restrictions. """
+    try:
+        if message.media:
+            media_content = await message.download_media(file=bytes)
+            # Use send_file which is versatile for sending from memory
+            await client.send_file(destination_id, file=media_content, caption=caption, link_preview=False)
+        elif message.text:
+            await client.send_message(destination_id, message=caption, link_preview=False)
+        return True
+    except Exception as e:
+        LOGGER.error(f"Failed to download and resend message {message.id} to {destination_id}: {e}")
+        return False
+
 # --- TELETHON CLIENT ENGINE ---
 client = TelegramClient(SESSION_NAME, int(API_ID), API_HASH)
 
@@ -62,52 +77,33 @@ async def handle_new_message(event):
     message = event.message
     active_tasks = tasks_collection.find({"source_ids": event.chat_id, "status": "active"})
     for task in active_tasks:
-        # --- ALL FILTER LOGIC RE-IMPLEMENTED ---
-        filters_doc = task.get("filters", {})
-        msg_text = message.text or ""
-        
-        # Media type filters
+        filters_doc = task.get("filters", {}); msg_text = message.text or ""
         if (filters_doc.get("block_photos") and message.photo) or \
            (filters_doc.get("block_videos") and message.video) or \
            (filters_doc.get("block_documents") and message.document) or \
            (filters_doc.get("block_text") and not message.media):
             continue
-
-        # Blacklist filter
         blacklist = filters_doc.get("blacklist_words")
         if blacklist and any(word.lower() in msg_text.lower() for word in blacklist.splitlines()):
             continue
-            
-        # Whitelist filter
         whitelist = filters_doc.get("whitelist_words")
         if whitelist and not any(word.lower() in msg_text.lower() for word in whitelist.splitlines()):
             continue
 
-        # --- CAPTION MODIFICATION LOGIC ---
-        mods = task.get("modifications", {})
-        final_caption = msg_text
-        if mods.get("remove_texts") and final_caption:
-            lines_to_remove = {line.strip() for line in mods["remove_texts"].splitlines() if line.strip()}
-            final_caption = "\n".join([line for line in final_caption.splitlines() if line.strip() not in lines_to_remove])
-        if mods.get("replace_rules") and final_caption:
+        mods = task.get("modifications", {}); final_caption = msg_text
+        if mods.get("remove_texts"): final_caption = "\n".join([line for line in final_caption.splitlines() if line.strip() not in {l.strip() for l in mods["remove_texts"].splitlines()}])
+        if mods.get("replace_rules"):
             for rule in mods["replace_rules"].splitlines():
-                if '=>' in rule:
-                    find, repl = rule.split('=>', 1); final_caption = final_caption.replace(find.strip(), repl.strip())
+                if '=>' in rule: find, repl = rule.split('=>', 1); final_caption = final_caption.replace(find.strip(), repl.strip())
         if mods.get("beautiful_captions"):
             new_caption = create_beautiful_caption(final_caption)
             if new_caption: final_caption = new_caption
-        if final_caption:
-            final_caption = re.sub(r'\n{3,}', '\n\n', final_caption).strip()
-        if mods.get("footer_text"):
-            final_caption = f"{final_caption or ''}\n\n{mods['footer_text']}"
+        if final_caption: final_caption = re.sub(r'\n{3,}', '\n\n', final_caption).strip()
+        if mods.get("footer_text"): final_caption = f"{final_caption or ''}\n\n{mods['footer_text']}"
         
-        # --- RELIABLE COPY LOGIC ---
         for dest_id in task.get("destination_ids", []):
-            LOGGER.info(f"Copying message {message.id} from task '{task['_id']}' to {dest_id}")
-            try:
-                await client.send_message(dest_id, file=message.media, message=final_caption, link_preview=False)
-            except Exception as e:
-                LOGGER.error(f"Failed to copy message to {dest_id}: {e}")
+            LOGGER.info(f"Copying message {message.id} via download/upload from task '{task['_id']}' to {dest_id}")
+            await download_and_resend(dest_id, message, final_caption)
             delay = task.get("settings", {}).get("delay", 0)
             if delay > 0: await asyncio.sleep(delay)
 
@@ -115,6 +111,7 @@ async def handle_new_message(event):
 (ASK_LABEL, ASK_SOURCE, ASK_DESTINATION, ASK_FOOTER, ASK_REPLACE, ASK_REMOVE, ASK_BLACKLIST, ASK_WHITELIST) = range(8)
 (MAIN_MENU, SETTINGS_MENU, GET_LINKS, GET_BATCH_DESTINATION) = range(8, 12)
 
+# ... [The UI part of the code from forward_command_handler to get_whitelist remains largely the same as it is working] ...
 async def forward_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, from_cancel=False):
     user_id = update.effective_user.id
     tasks = list(tasks_collection.find({"owner_id": user_id}))
@@ -139,12 +136,13 @@ async def save_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         status_msg = await update.message.reply_text("Fetching post...")
         message = await client.get_messages(chat_id, ids=msg_id)
         if not message: await status_msg.edit_text("Could not fetch message."); return
-        media_content = await message.download_media(file=bytes) if message.media else None
+        
+        # Using the same robust method for save
+        success = await download_and_resend(update.effective_chat.id, message, message.text)
         await status_msg.delete()
-        if message.photo: await update.message.reply_photo(photo=media_content, caption=message.text)
-        elif message.video: await update.message.reply_video(video=media_content, caption=message.text)
-        elif message.document: await update.message.reply_document(document=media_content, caption=message.text)
-        elif message.text: await update.message.reply_text(message.text, disable_web_page_preview=True)
+        if not success:
+            await update.message.reply_text("Failed to save the post due to an error.")
+
     except Exception as e:
         await update.message.reply_text(f"An error occurred: {e}\n\nMake sure your User Account has joined the source channel.")
         LOGGER.error(f"Error in /save command: {e}")
@@ -169,8 +167,8 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
         task_id, filter_type = value.split(":")
         task = tasks_collection.find_one({"_id": task_id, "owner_id": user_id})
         if task:
-            db_field = "modifications.beautiful_captions" if action == "settings_toggle_beautify" else f"filters.{filter_type}"
-            current_status = task.get("modifications", {}).get("beautiful_captions", False) if action == "settings_toggle_beautify" else task.get("filters", {}).get(filter_type, False)
+            db_field = "modifications.beautiful_captions" if "beautify" in action else f"filters.{filter_type}"
+            current_status = task.get("modifications", {}).get("beautiful_captions", False) if "beautify" in action else task.get("filters", {}).get(filter_type, False)
             tasks_collection.update_one({"_id": task_id}, {"$set": {db_field: not current_status}})
         context.user_data['current_task_id'] = task_id
         return await show_settings_menu(update, context)
@@ -191,18 +189,14 @@ async def show_settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
     task_id = context.user_data.get('current_task_id')
     task = tasks_collection.find_one({"_id": task_id})
     if not task: await update.callback_query.edit_message_text("Error: Task not found."); return MAIN_MENU
-    
     mods = task.get("modifications", {}); filters_doc = task.get("filters", {})
     beautify_emoji = "✅" if mods.get("beautiful_captions") else "❌"
-    
     def f_emoji(f_type): return "✅" if filters_doc.get(f_type) else "❌"
-    
     source_info = await get_chat_titles(task.get('source_ids', []))
     dest_info = await get_chat_titles(task.get('destination_ids', []))
     text = (f"*Settings for task: {task_id}*\n\n"
             f"Source(s):\n{source_info}\n\n"
             f"Destination(s):\n{dest_info}")
-            
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton(f"{f_emoji('block_photos')} Photos", callback_data=f"settings_toggle_filter:{task_id}:block_photos"),
          InlineKeyboardButton(f"{f_emoji('block_videos')} Videos", callback_data=f"settings_toggle_filter:{task_id}:block_videos")],
@@ -279,23 +273,31 @@ async def get_links(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await update.message.reply_text("Invalid or mismatched links. Or /cancel."); return GET_LINKS
     context.user_data['batch_info'] = {'channel_id': start_channel, 'start_id': start_msg_id, 'end_id': end_msg_id}
     await update.message.reply_text("✅ Links OK. Send destination chat ID.\n\nOr /cancel."); return GET_BATCH_DESTINATION
+
+# --- BATCH FUNCTION COMPLETELY REWRITTEN FOR RELIABILITY ---
 async def get_batch_destination(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     dest_id = update.message.forward_origin.chat.id if update.message.forward_origin else (parse_chat_ids(update.message.text) or [None])[0]
     if not dest_id: await update.message.reply_text("Invalid destination. Try again or /cancel."); return GET_BATCH_DESTINATION
-    info = context.user_data['batch_info']; total_range = info['end_id'] - info['start_id'] + 1
-    status_msg = await update.message.reply_text(f"Starting batch copy of up to {total_range} messages...")
+    
+    info = context.user_data['batch_info']
+    status_msg = await update.message.reply_text(f"Fetching messages from {info['start_id']} to {info['end_id']}...")
     count, errors = 0, 0
     try:
         messages_to_copy = await client.get_messages(info['channel_id'], ids=range(info['start_id'], info['end_id'] + 1))
-        for i, message in enumerate(messages_to_copy):
-            if message:
-                try:
-                    await client.send_message(dest_id, file=message.media, message=message.text, link_preview=False)
-                    count += 1
-                except Exception as e:
-                    LOGGER.error(f"Batch copy error for msg {message.id}: {e}"); errors += 1
-            if (i + 1) % 10 == 0: await status_msg.edit_text(f"Progress: {i+1}/{total_range} messages checked...")
-            await asyncio.sleep(1.5)
+        # Filter out None values from deleted messages
+        existing_messages = [m for m in messages_to_copy if m is not None]
+        total_found = len(existing_messages)
+        
+        await status_msg.edit_text(f"Found {total_found} messages. Starting copy process...")
+
+        for i, message in enumerate(existing_messages):
+            if await download_and_resend(dest_id, message, message.text):
+                count += 1
+            else:
+                errors += 1
+            
+            if (i + 1) % 5 == 0: await status_msg.edit_text(f"Progress: {i+1}/{total_found} messages copied...")
+            await asyncio.sleep(2) # Increased delay for stability with large files
     except Exception as e:
         await status_msg.edit_text(f"A critical error occurred: {e}"); return ConversationHandler.END
     await status_msg.edit_text(f"✅ Batch complete!\n\nSuccess: {count}\nFailed: {errors}"); return ConversationHandler.END
