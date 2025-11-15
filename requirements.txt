@@ -1,6 +1,8 @@
 telethon
 python-telegram-bot>=20.0
+pymongo[srv]
 python-dotenv
+apscheduler==3.10.4
+pytz
 opencv-python-headless
 Pillow
-pymongo[srv]
