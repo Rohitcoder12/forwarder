@@ -52,21 +52,38 @@ def create_beautiful_caption(original_text):
     caption_parts = [f"Watch Full Videos {emojis[0]}{emojis[1]}"] + [f"V{i}:\n{link}" for i, link in enumerate(links, 1)]
     return "\n\n".join(caption_parts)
 
-# --- THE ONLY CORRECT WAY TO BYPASS PROTECTION ---
-async def download_and_resend(destination_id: int, message: Message, caption: str | None) -> bool:
-    """ Downloads media to memory and re-uploads it, preserving format and bypassing all restrictions. """
+# --- NEW ALBUM HANDLING LOGIC ---
+ALBUM_HANDLING_TASKS = {}
+
+async def process_album(task_id, group_id, dest_ids, caption):
+    """Waits, collects all media from an album, and sends it as a group."""
+    await asyncio.sleep(3)  # Wait 3 seconds to collect all parts of the album
+    
+    album_key = f"{task_id}_{group_id}"
+    messages = ALBUM_HANDLING_TASKS.get(album_key, [])
+    if not messages:
+        return
+
+    del ALBUM_HANDLING_TASKS[album_key] # Clean up
+    
+    paths = []
     try:
-        if message.media:
-            # Step 1: Download the media file's raw data into memory.
-            media_content = await message.download_media(file=bytes)
-            # Step 2: Upload the raw data as a new file. send_file is smart and preserves the format.
-            await client.send_file(destination_id, file=media_content, caption=caption, link_preview=False)
-        elif message.text:
-            await client.send_message(destination_id, message=caption, link_preview=False)
-        return True
+        # Download all media to temporary files
+        for i, msg in enumerate(messages):
+            path = await msg.download_media(file=f"temp_{task_id}_{group_id}_{i}")
+            paths.append(path)
+        
+        # Send all files together as an album
+        for dest_id in dest_ids:
+             await client.send_file(dest_id, paths, caption=caption, link_preview=False)
+
     except Exception as e:
-        LOGGER.error(f"Failed to download and resend message {message.id} to {destination_id}: {e}")
-        return False
+        LOGGER.error(f"Error processing album {group_id}: {e}")
+    finally:
+        # Clean up all temporary files
+        for path in paths:
+            if os.path.exists(path):
+                os.remove(path)
 
 # --- TELETHON CLIENT ENGINE ---
 client = TelegramClient(SESSION_NAME, int(API_ID), API_HASH)
@@ -77,6 +94,7 @@ async def handle_new_message(event):
     message = event.message
     active_tasks = tasks_collection.find({"source_ids": event.chat_id, "status": "active"})
     for task in active_tasks:
+        # --- FILTER LOGIC ---
         filters_doc = task.get("filters", {}); msg_text = message.text or ""
         if (filters_doc.get("block_photos") and message.photo) or \
            (filters_doc.get("block_videos") and message.video) or \
@@ -87,6 +105,7 @@ async def handle_new_message(event):
         whitelist = filters_doc.get("whitelist_words")
         if whitelist and not any(word.lower() in msg_text.lower() for word in whitelist.splitlines()): continue
 
+        # --- CAPTION MODIFICATION LOGIC ---
         mods = task.get("modifications", {}); final_caption = msg_text
         if mods.get("remove_texts"): final_caption = "\n".join([line for line in final_caption.splitlines() if line.strip() not in {l.strip() for l in mods["remove_texts"].splitlines()}])
         if mods.get("replace_rules"):
@@ -98,15 +117,40 @@ async def handle_new_message(event):
         if final_caption: final_caption = re.sub(r'\n{3,}', '\n\n', final_caption).strip()
         if mods.get("footer_text"): final_caption = f"{final_caption or ''}\n\n{mods['footer_text']}"
         
-        for dest_id in task.get("destination_ids", []):
-            LOGGER.info(f"Copying message {message.id} via download/upload from task '{task['_id']}' to {dest_id}")
-            await download_and_resend(dest_id, message, final_caption)
-            delay = task.get("settings", {}).get("delay", 0)
-            if delay > 0: await asyncio.sleep(delay)
+        dest_ids = task.get("destination_ids", [])
+        
+        # --- NEW ALBUM/SINGLE MEDIA LOGIC ---
+        if message.grouped_id:
+            album_key = f"{task['_id']}_{message.grouped_id}"
+            if album_key not in ALBUM_HANDLING_TASKS:
+                ALBUM_HANDLING_TASKS[album_key] = []
+                # Schedule processing for this new album
+                asyncio.create_task(process_album(task['_id'], message.grouped_id, dest_ids, final_caption))
+            ALBUM_HANDLING_TASKS[album_key].append(message)
+        else:
+            # Process as a single message
+            path = None
+            try:
+                if message.media:
+                    path = await message.download_media(file=f"temp_single_{message.id}")
+                
+                for dest_id in dest_ids:
+                    LOGGER.info(f"Copying single message {message.id} from task '{task['_id']}' to {dest_id}")
+                    await client.send_file(dest_id, path or message.text, caption=final_caption, link_preview=False)
+                
+                delay = task.get("settings", {}).get("delay", 0)
+                if delay > 0: await asyncio.sleep(delay)
+            except Exception as e:
+                LOGGER.error(f"Failed to copy single message to dest_id: {e}")
+            finally:
+                if path and os.path.exists(path):
+                    os.remove(path)
 
 # --- TELEGRAM BOT INTERFACE ---
 (ASK_LABEL, ASK_SOURCE, ASK_DESTINATION, ASK_FOOTER, ASK_REPLACE, ASK_REMOVE, ASK_BLACKLIST, ASK_WHITELIST) = range(8)
 (MAIN_MENU, SETTINGS_MENU, GET_LINKS, GET_BATCH_DESTINATION) = range(8, 12)
+
+# ... [The UI part of the code from forward_command_handler to the end remains the same, as it is working correctly. It is included here for completeness.] ...
 
 async def forward_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, from_cancel=False):
     user_id = update.effective_user.id
@@ -133,13 +177,19 @@ async def save_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         message = await client.get_messages(chat_id, ids=msg_id)
         if not message: await status_msg.edit_text("Could not fetch message."); return
         
-        success = await download_and_resend(update.effective_chat.id, message, message.text)
+        path = None
+        if message.media:
+            path = await message.download_media(file=f"temp_save_{message.id}")
+        
+        await client.send_file(update.effective_chat.id, path or message.text, caption=message.text, link_preview=False)
         await status_msg.delete()
-        if not success:
-            await update.message.reply_text("Failed to save the post due to an error.")
     except Exception as e:
         await status_msg.edit_text(f"An error occurred: {e}\n\nMake sure your User Account has joined the source channel.")
         LOGGER.error(f"Error in /save command: {e}")
+    finally:
+        if 'path' in locals() and path and os.path.exists(path):
+            os.remove(path)
+
 
 async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await query.answer()
@@ -278,16 +328,45 @@ async def get_batch_destination(update: Update, context: ContextTypes.DEFAULT_TY
         existing_messages = [m for m in messages_to_copy if m is not None]
         total_found = len(existing_messages)
         await status_msg.edit_text(f"Found {total_found} messages. Starting copy process...")
-        for i, message in enumerate(existing_messages):
-            if await download_and_resend(dest_id, message, message.text):
-                count += 1
-            else:
-                errors += 1
-            if (i + 1) % 5 == 0: await status_msg.edit_text(f"Progress: {i+1}/{total_found} messages copied...")
+        
+        # Use the same album logic as live forwarding for batches
+        i = 0
+        while i < total_found:
+            message = existing_messages[i]
+            if message.grouped_id:
+                album = [m for m in existing_messages[i:] if m.grouped_id == message.grouped_id]
+                paths = []
+                try:
+                    for j, msg in enumerate(album):
+                        path = await msg.download_media(file=f"temp_batch_{msg.id}_{j}")
+                        paths.append(path)
+                    await client.send_file(dest_id, paths, caption=album[0].text)
+                    count += len(album)
+                except Exception as e:
+                    LOGGER.error(f"Batch album copy error for group {message.grouped_id}: {e}"); errors += len(album)
+                finally:
+                    for path in paths:
+                        if os.path.exists(path): os.remove(path)
+                i += len(album) # Skip past all the messages in this album
+            else: # Handle single message
+                path = None
+                try:
+                    if message.media: path = await message.download_media(file=f"temp_batch_single_{message.id}")
+                    await client.send_file(dest_id, path or message.text, caption=message.text, link_preview=False)
+                    count += 1
+                except Exception as e:
+                    LOGGER.error(f"Batch single copy error for msg {message.id}: {e}"); errors += 1
+                finally:
+                    if path and os.path.exists(path): os.remove(path)
+                i += 1 # Move to the next message
+            
+            if (i) % 5 == 0: await status_msg.edit_text(f"Progress: {i}/{total_found} messages processed...")
             await asyncio.sleep(2)
+
     except Exception as e:
-        await status_msg.edit_text(f"A critical error occurred: {e}"); return ConversationHandler.END
+        await status_msg.edit_text(f"A critical error occurred during batch: {e}"); return ConversationHandler.END
     await status_msg.edit_text(f"✅ Batch complete!\n\nSuccess: {count}\nFailed: {errors}"); return ConversationHandler.END
+
 
 async def main():
     global MY_ID
