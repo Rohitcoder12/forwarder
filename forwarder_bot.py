@@ -6,8 +6,6 @@ import logging
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
 from telethon.tl.types import Message
-from telethon.errors.rpcerrorlist import PeerIdInvalidError
-from telegram import (Update, InlineKeyboardButton, InlineKeyboardMarkup)
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -53,21 +51,6 @@ def create_beautiful_caption(original_text):
     caption_parts = [f"Watch Full Videos {emojis[0]}{emojis[1]}"] + [f"V{i}:\n{link}" for i, link in enumerate(links, 1)]
     return "\n\n".join(caption_parts)
 
-# --- NEW: UNIVERSAL DOWNLOAD & RESEND FUNCTION TO BYPASS PROTECTION ---
-async def download_and_resend(destination_id: int, message: Message, caption: str | None) -> bool:
-    """ Downloads media to memory and re-uploads it, bypassing all restrictions. """
-    try:
-        if message.media:
-            media_content = await message.download_media(file=bytes)
-            # Use send_file which is versatile for sending from memory
-            await client.send_file(destination_id, file=media_content, caption=caption, link_preview=False)
-        elif message.text:
-            await client.send_message(destination_id, message=caption, link_preview=False)
-        return True
-    except Exception as e:
-        LOGGER.error(f"Failed to download and resend message {message.id} to {destination_id}: {e}")
-        return False
-
 # --- TELETHON CLIENT ENGINE ---
 client = TelegramClient(SESSION_NAME, int(API_ID), API_HASH)
 
@@ -101,9 +84,13 @@ async def handle_new_message(event):
         if final_caption: final_caption = re.sub(r'\n{3,}', '\n\n', final_caption).strip()
         if mods.get("footer_text"): final_caption = f"{final_caption or ''}\n\n{mods['footer_text']}"
         
+        # --- FIX: USE THE DIRECT & RELIABLE COPY METHOD ---
         for dest_id in task.get("destination_ids", []):
-            LOGGER.info(f"Copying message {message.id} via download/upload from task '{task['_id']}' to {dest_id}")
-            await download_and_resend(dest_id, message, final_caption)
+            LOGGER.info(f"Copying message {message.id} from task '{task['_id']}' to {dest_id}")
+            try:
+                await client.send_message(dest_id, file=message, message=final_caption, link_preview=False)
+            except Exception as e:
+                LOGGER.error(f"Failed to copy message to {dest_id}: {e}")
             delay = task.get("settings", {}).get("delay", 0)
             if delay > 0: await asyncio.sleep(delay)
 
@@ -111,7 +98,6 @@ async def handle_new_message(event):
 (ASK_LABEL, ASK_SOURCE, ASK_DESTINATION, ASK_FOOTER, ASK_REPLACE, ASK_REMOVE, ASK_BLACKLIST, ASK_WHITELIST) = range(8)
 (MAIN_MENU, SETTINGS_MENU, GET_LINKS, GET_BATCH_DESTINATION) = range(8, 12)
 
-# ... [The UI part of the code from forward_command_handler to get_whitelist remains largely the same as it is working] ...
 async def forward_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, from_cancel=False):
     user_id = update.effective_user.id
     tasks = list(tasks_collection.find({"owner_id": user_id}))
@@ -137,14 +123,11 @@ async def save_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         message = await client.get_messages(chat_id, ids=msg_id)
         if not message: await status_msg.edit_text("Could not fetch message."); return
         
-        # Using the same robust method for save
-        success = await download_and_resend(update.effective_chat.id, message, message.text)
+        # FIX: Use the direct copy method for the bot to reply
+        await client.send_message(update.effective_chat.id, file=message, message=message.text, link_preview=False)
         await status_msg.delete()
-        if not success:
-            await update.message.reply_text("Failed to save the post due to an error.")
-
     except Exception as e:
-        await update.message.reply_text(f"An error occurred: {e}\n\nMake sure your User Account has joined the source channel.")
+        await status_msg.edit_text(f"An error occurred: {e}\n\nMake sure your User Account has joined the source channel.")
         LOGGER.error(f"Error in /save command: {e}")
 
 async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -274,30 +257,26 @@ async def get_links(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data['batch_info'] = {'channel_id': start_channel, 'start_id': start_msg_id, 'end_id': end_msg_id}
     await update.message.reply_text("✅ Links OK. Send destination chat ID.\n\nOr /cancel."); return GET_BATCH_DESTINATION
 
-# --- BATCH FUNCTION COMPLETELY REWRITTEN FOR RELIABILITY ---
 async def get_batch_destination(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     dest_id = update.message.forward_origin.chat.id if update.message.forward_origin else (parse_chat_ids(update.message.text) or [None])[0]
     if not dest_id: await update.message.reply_text("Invalid destination. Try again or /cancel."); return GET_BATCH_DESTINATION
-    
     info = context.user_data['batch_info']
     status_msg = await update.message.reply_text(f"Fetching messages from {info['start_id']} to {info['end_id']}...")
     count, errors = 0, 0
     try:
         messages_to_copy = await client.get_messages(info['channel_id'], ids=range(info['start_id'], info['end_id'] + 1))
-        # Filter out None values from deleted messages
         existing_messages = [m for m in messages_to_copy if m is not None]
         total_found = len(existing_messages)
-        
         await status_msg.edit_text(f"Found {total_found} messages. Starting copy process...")
-
         for i, message in enumerate(existing_messages):
-            if await download_and_resend(dest_id, message, message.text):
+            try:
+                # --- FIX: USE THE DIRECT & RELIABLE COPY METHOD ---
+                await client.send_message(dest_id, file=message, message=message.text, link_preview=False)
                 count += 1
-            else:
-                errors += 1
-            
+            except Exception as e:
+                LOGGER.error(f"Batch copy error for msg {message.id}: {e}"); errors += 1
             if (i + 1) % 5 == 0: await status_msg.edit_text(f"Progress: {i+1}/{total_found} messages copied...")
-            await asyncio.sleep(2) # Increased delay for stability with large files
+            await asyncio.sleep(2)
     except Exception as e:
         await status_msg.edit_text(f"A critical error occurred: {e}"); return ConversationHandler.END
     await status_msg.edit_text(f"✅ Batch complete!\n\nSuccess: {count}\nFailed: {errors}"); return ConversationHandler.END
