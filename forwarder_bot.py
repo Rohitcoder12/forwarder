@@ -360,11 +360,80 @@ async def edit_setting_ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 async def save_setting_text(update: Update, context: ContextTypes.DEFAULT_TYPE, db_key_path: str):
     task_id = context.user_data.get('current_task_id')
     if not task_id: return ConversationHandler.END
-    new_value = update.message.text if update.message.text.lower() != '/skip' else None
+    
+    # Check if user wants to skip (delete all)
+    if update.message.text.strip().lower() == '/skip':
+        new_value = None
+    else:
+        new_value = update.message.text.strip()
+    
     tasks_collection.update_one({"_id": task_id}, {"$set": {db_key_path: new_value}})
-    await update.message.reply_text("✅ Setting updated successfully!")
-    await forward_command_handler(update, context)
-    return ConversationHandler.END
+    
+    if new_value is None:
+        await update.message.reply_text("✅ Setting cleared successfully!")
+    else:
+        await update.message.reply_text("✅ Setting updated successfully!")
+    
+    context.user_data['current_task_id'] = task_id
+    await asyncio.sleep(1)
+    
+    # Create a fake update to show settings menu
+    fake_query = type('obj', (object,), {
+        'callback_query': type('obj', (object,), {
+            'edit_message_text': lambda *args, **kwargs: context.bot.send_message(
+                chat_id=update.effective_chat.id, 
+                *args, 
+                **kwargs
+            ),
+            'from_user': update.effective_user,
+            'message': update.message
+        })()
+    })()
+    
+    return await show_settings_menu_after_edit(update, context)
+
+async def show_settings_menu_after_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show settings menu after editing a setting"""
+    task_id = context.user_data.get('current_task_id')
+    task = tasks_collection.find_one({"_id": task_id})
+    if not task: 
+        await context.bot.send_message(chat_id=update.effective_chat.id, text="❌ Error: Task not found.")
+        return ConversationHandler.END
+    
+    mods = task.get("modifications", {})
+    filters_doc = task.get("filters", {})
+    settings = task.get("settings", {})
+    beautify_emoji = "✅" if mods.get("beautiful_captions") else "❌"
+    def f_emoji(f_type): return "✅" if filters_doc.get(f_type) else "❌"
+    
+    source_info = await get_chat_titles(task.get('source_ids', []))
+    dest_info = await get_chat_titles(task.get('destination_ids', []))
+    delay = settings.get('delay', 0)
+    
+    text = f"⚙️ *Settings for: {task_id}*\n\n📥 *Sources:*\n{source_info}\n\n📤 *Destinations:*\n{dest_info}\n\n⏱️ *Delay:* {delay}s between messages"
+    
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"{f_emoji('block_photos')} Photos", callback_data=f"settings_toggle_filter:{task_id}:block_photos"), 
+         InlineKeyboardButton(f"{f_emoji('block_videos')} Videos", callback_data=f"settings_toggle_filter:{task_id}:block_videos")],
+        [InlineKeyboardButton(f"{f_emoji('block_documents')} Docs", callback_data=f"settings_toggle_filter:{task_id}:block_documents"), 
+         InlineKeyboardButton(f"{f_emoji('block_text')} Text", callback_data=f"settings_toggle_filter:{task_id}:block_text")],
+        [InlineKeyboardButton("📝 Blacklist", callback_data="settings_edit_blacklist"), 
+         InlineKeyboardButton("📝 Whitelist", callback_data="settings_edit_whitelist")],
+        [InlineKeyboardButton(f"{beautify_emoji} Beautiful Captions", callback_data=f"settings_toggle_beautify:{task_id}:_")],
+        [InlineKeyboardButton("📝 Footer", callback_data="settings_edit_footer"), 
+         InlineKeyboardButton("🔄 Replace", callback_data="settings_edit_replace")],
+        [InlineKeyboardButton("✂️ Remove Text", callback_data="settings_edit_remove"), 
+         InlineKeyboardButton("⏱️ Delay", callback_data="settings_edit_delay")],
+        [InlineKeyboardButton("⬅️ Back", callback_data="back_to_main_menu")]
+    ])
+    
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id, 
+        text=text, 
+        reply_markup=keyboard, 
+        parse_mode='Markdown'
+    )
+    return SETTINGS_MENU
 
 async def get_footer(update: Update, context: ContextTypes.DEFAULT_TYPE): return await save_setting_text(update, context, "modifications.footer_text")
 async def get_replace_rules(update: Update, context: ContextTypes.DEFAULT_TYPE): return await save_setting_text(update, context, "modifications.replace_rules")
