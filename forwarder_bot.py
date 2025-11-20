@@ -250,26 +250,6 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
     elif action == "settings_menu":
         context.user_data['current_task_id'] = value
         return await show_settings_menu(update, context)
-    elif action == "view_replace":
-        task_id = value
-        task = tasks_collection.find_one({"_id": task_id, "owner_id": user_id})
-        if task:
-            replace_rules = task.get("modifications", {}).get("replace_rules", "No replace rules set")
-            text = f"🔄 *Replace Rules for: {task_id}*\n\n{replace_rules or 'No replace rules set'}"
-        else: text = "❌ Task not found"
-        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data=f"settings_menu:{task_id}")]])
-        await query.edit_message_text(text, reply_markup=keyboard, parse_mode='Markdown')
-        return SETTINGS_MENU
-    elif action == "view_remove":
-        task_id = value
-        task = tasks_collection.find_one({"_id": task_id, "owner_id": user_id})
-        if task:
-            remove_texts = task.get("modifications", {}).get("remove_texts", "No remove texts set")
-            text = f"✂️ *Remove Texts for: {task_id}*\n\n{remove_texts or 'No remove texts set'}"
-        else: text = "❌ Task not found"
-        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data=f"settings_menu:{task_id}")]])
-        await query.edit_message_text(text, reply_markup=keyboard, parse_mode='Markdown')
-        return SETTINGS_MENU
 
 async def get_chat_titles(ids: list) -> str:
     titles = []
@@ -291,7 +271,7 @@ async def show_settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
     dest_info = await get_chat_titles(task.get('destination_ids', []))
     delay = settings.get('delay', 0)
     text = f"⚙️ *Settings for: {task_id}*\n\n📥 *Sources:*\n{source_info}\n\n📤 *Destinations:*\n{dest_info}\n\n⏱️ *Delay:* {delay}s between messages"
-    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton(f"{f_emoji('block_photos')} Photos", callback_data=f"settings_toggle_filter:{task_id}:block_photos"), InlineKeyboardButton(f"{f_emoji('block_videos')} Videos", callback_data=f"settings_toggle_filter:{task_id}:block_videos")], [InlineKeyboardButton(f"{f_emoji('block_documents')} Docs", callback_data=f"settings_toggle_filter:{task_id}:block_documents"), InlineKeyboardButton(f"{f_emoji('block_text')} Text", callback_data=f"settings_toggle_filter:{task_id}:block_text")], [InlineKeyboardButton("📝 Blacklist", callback_data="settings_edit_blacklist"), InlineKeyboardButton("📝 Whitelist", callback_data="settings_edit_whitelist")], [InlineKeyboardButton(f"{beautify_emoji} Beautiful Captions", callback_data=f"settings_toggle_beautify:{task_id}:_")], [InlineKeyboardButton("📝 Footer", callback_data="settings_edit_footer"), InlineKeyboardButton("🔄 Replace", callback_data="settings_edit_replace")], [InlineKeyboardButton("👁️ View Replace", callback_data=f"view_replace:{task_id}"), InlineKeyboardButton("👁️ View Remove", callback_data=f"view_remove:{task_id}")], [InlineKeyboardButton("✂️ Remove Text", callback_data="settings_edit_remove"), InlineKeyboardButton("⏱️ Delay", callback_data="settings_edit_delay")], [InlineKeyboardButton("⬅️ Back", callback_data="back_to_main_menu")]])
+    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton(f"{f_emoji('block_photos')} Photos", callback_data=f"settings_toggle_filter:{task_id}:block_photos"), InlineKeyboardButton(f"{f_emoji('block_videos')} Videos", callback_data=f"settings_toggle_filter:{task_id}:block_videos")], [InlineKeyboardButton(f"{f_emoji('block_documents')} Docs", callback_data=f"settings_toggle_filter:{task_id}:block_documents"), InlineKeyboardButton(f"{f_emoji('block_text')} Text", callback_data=f"settings_toggle_filter:{task_id}:block_text")], [InlineKeyboardButton("📝 Blacklist", callback_data="settings_edit_blacklist"), InlineKeyboardButton("📝 Whitelist", callback_data="settings_edit_whitelist")], [InlineKeyboardButton(f"{beautify_emoji} Beautiful Captions", callback_data=f"settings_toggle_beautify:{task_id}:_")], [InlineKeyboardButton("📝 Footer", callback_data="settings_edit_footer"), InlineKeyboardButton("🔄 Replace", callback_data="settings_edit_replace")], [InlineKeyboardButton("✂️ Remove Text", callback_data="settings_edit_remove"), InlineKeyboardButton("⏱️ Delay", callback_data="settings_edit_delay")], [InlineKeyboardButton("⬅️ Back", callback_data="back_to_main_menu")]])
     await update.callback_query.edit_message_text(text, reply_markup=keyboard, parse_mode='Markdown')
     return SETTINGS_MENU
 
@@ -326,11 +306,55 @@ async def get_destination(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 async def edit_setting_ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     action = update.callback_query.data
-    state_map = {"settings_edit_footer": (ASK_FOOTER, "📝 Send the new footer text.\n\nSend /skip to remove the current footer.\n\nOr /cancel."), "settings_edit_replace": (ASK_REPLACE, "🔄 Send replace rules in format:\n`find => replace`\n\nOne rule per line.\n\nSend /skip to remove all rules.\n\nOr /cancel."), "settings_edit_remove": (ASK_REMOVE, "✂️ Send texts to remove (one per line).\n\nSend /skip to clear the list.\n\nOr /cancel."), "settings_edit_blacklist": (ASK_BLACKLIST, "📝 Send blacklist words (one per line).\n\nMessages containing these words will be ignored.\n\nSend /skip to clear.\n\nOr /cancel."), "settings_edit_whitelist": (ASK_WHITELIST, "📝 Send whitelist words (one per line).\n\nOnly messages containing these words will be forwarded.\n\nSend /skip to clear.\n\nOr /cancel."), "settings_edit_delay": (ASK_DELAY, "⏱️ Send delay in seconds between forwarding messages.\n\nSend `0` for no delay.\n\nOr /cancel.")}
-    if action in state_map:
-        state, text = state_map[action]
+    task_id = context.user_data.get('current_task_id')
+    task = tasks_collection.find_one({"_id": task_id})
+    
+    if action == "settings_edit_footer":
+        text = "📝 Send the new footer text.\n\nSend /skip to remove the current footer.\n\nOr /cancel."
         await update.callback_query.edit_message_text(text, parse_mode='Markdown')
-        return state
+        return ASK_FOOTER
+    
+    elif action == "settings_edit_replace":
+        current_rules = task.get("modifications", {}).get("replace_rules", "")
+        if current_rules:
+            text = f"🔄 *Current Replace Rules:*\n```\n{current_rules}\n```\n\nSend new replace rules in format:\n`find => replace`\n\nOne rule per line.\n\n*To delete all:* Send /skip\n*To keep and add more:* Just send new rules\n\nOr /cancel."
+        else:
+            text = "🔄 Send replace rules in format:\n`find => replace`\n\nOne rule per line.\n\nSend /skip to remove all rules.\n\nOr /cancel."
+        await update.callback_query.edit_message_text(text, parse_mode='Markdown')
+        return ASK_REPLACE
+    
+    elif action == "settings_edit_remove":
+        current_texts = task.get("modifications", {}).get("remove_texts", "")
+        if current_texts:
+            text = f"✂️ *Current Remove Texts:*\n```\n{current_texts}\n```\n\nSend new texts to remove (one per line).\n\n*To delete all:* Send /skip\n*To keep and add more:* Just send new texts\n\nOr /cancel."
+        else:
+            text = "✂️ Send texts to remove (one per line).\n\nSend /skip to clear the list.\n\nOr /cancel."
+        await update.callback_query.edit_message_text(text, parse_mode='Markdown')
+        return ASK_REMOVE
+    
+    elif action == "settings_edit_blacklist":
+        current_blacklist = task.get("filters", {}).get("blacklist_words", "")
+        if current_blacklist:
+            text = f"📝 *Current Blacklist Words:*\n```\n{current_blacklist}\n```\n\nSend new blacklist words (one per line).\n\nMessages containing these words will be ignored.\n\n*To delete all:* Send /skip\n*To keep and add more:* Just send new words\n\nOr /cancel."
+        else:
+            text = "📝 Send blacklist words (one per line).\n\nMessages containing these words will be ignored.\n\nSend /skip to clear.\n\nOr /cancel."
+        await update.callback_query.edit_message_text(text, parse_mode='Markdown')
+        return ASK_BLACKLIST
+    
+    elif action == "settings_edit_whitelist":
+        current_whitelist = task.get("filters", {}).get("whitelist_words", "")
+        if current_whitelist:
+            text = f"📝 *Current Whitelist Words:*\n```\n{current_whitelist}\n```\n\nSend new whitelist words (one per line).\n\nOnly messages containing these words will be forwarded.\n\n*To delete all:* Send /skip\n*To keep and add more:* Just send new words\n\nOr /cancel."
+        else:
+            text = "📝 Send whitelist words (one per line).\n\nOnly messages containing these words will be forwarded.\n\nSend /skip to clear.\n\nOr /cancel."
+        await update.callback_query.edit_message_text(text, parse_mode='Markdown')
+        return ASK_WHITELIST
+    
+    elif action == "settings_edit_delay":
+        text = "⏱️ Send delay in seconds between forwarding messages.\n\nSend `0` for no delay.\n\nOr /cancel."
+        await update.callback_query.edit_message_text(text, parse_mode='Markdown')
+        return ASK_DELAY
+    
     return SETTINGS_MENU
 
 async def save_setting_text(update: Update, context: ContextTypes.DEFAULT_TYPE, db_key_path: str):
@@ -565,7 +589,7 @@ async def main():
     global MY_ID
     application = Application.builder().token(BOT_TOKEN).connect_timeout(30).read_timeout(30).write_timeout(60).pool_timeout(30).build()
     cancel_handler = CommandHandler('cancel', cancel)
-    conv_handler = ConversationHandler(entry_points=[CommandHandler("forward", forward_command_handler), CallbackQueryHandler(callback_query_handler, pattern="^(toggle_status|delete_confirm|settings_menu|settings_toggle_beautify|settings_toggle_filter|view_stats|view_replace|view_remove)"), CallbackQueryHandler(new_task_start, pattern="^new_task_start$")], states={MAIN_MENU: [CallbackQueryHandler(new_task_start, pattern="^new_task_start$"), CallbackQueryHandler(callback_query_handler, pattern="^(toggle_status|delete_confirm|delete_execute|settings_menu|settings_toggle_beautify|settings_toggle_filter|view_stats|view_replace|view_remove|back_to_main_menu)")], SETTINGS_MENU: [CallbackQueryHandler(edit_setting_ask, pattern="^settings_edit_"), CallbackQueryHandler(forward_command_handler, pattern="^back_to_main_menu$"), CallbackQueryHandler(callback_query_handler, pattern="^(settings_toggle_beautify|settings_toggle_filter|view_replace|view_remove|settings_menu)")], ASK_LABEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_label)], ASK_SOURCE: [MessageHandler(filters.ALL & ~filters.COMMAND, get_source)], ASK_DESTINATION: [MessageHandler(filters.ALL & ~filters.COMMAND, get_destination)], ASK_FOOTER: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_footer)], ASK_REPLACE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_replace_rules)], ASK_REMOVE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_remove_texts)], ASK_BLACKLIST: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_blacklist)], ASK_WHITELIST: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_whitelist)], ASK_DELAY: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_delay)]}, fallbacks=[cancel_handler], per_message=False)
+    conv_handler = ConversationHandler(entry_points=[CommandHandler("forward", forward_command_handler), CallbackQueryHandler(callback_query_handler, pattern="^(toggle_status|delete_confirm|settings_menu|settings_toggle_beautify|settings_toggle_filter|view_stats)"), CallbackQueryHandler(new_task_start, pattern="^new_task_start$")], states={MAIN_MENU: [CallbackQueryHandler(new_task_start, pattern="^new_task_start$"), CallbackQueryHandler(callback_query_handler, pattern="^(toggle_status|delete_confirm|delete_execute|settings_menu|settings_toggle_beautify|settings_toggle_filter|view_stats|back_to_main_menu)")], SETTINGS_MENU: [CallbackQueryHandler(edit_setting_ask, pattern="^settings_edit_"), CallbackQueryHandler(forward_command_handler, pattern="^back_to_main_menu$"), CallbackQueryHandler(callback_query_handler, pattern="^(settings_toggle_beautify|settings_toggle_filter|settings_menu)")], ASK_LABEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_label)], ASK_SOURCE: [MessageHandler(filters.ALL & ~filters.COMMAND, get_source)], ASK_DESTINATION: [MessageHandler(filters.ALL & ~filters.COMMAND, get_destination)], ASK_FOOTER: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_footer)], ASK_REPLACE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_replace_rules)], ASK_REMOVE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_remove_texts)], ASK_BLACKLIST: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_blacklist)], ASK_WHITELIST: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_whitelist)], ASK_DELAY: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_delay)]}, fallbacks=[cancel_handler], per_message=False)
     batch_conv = ConversationHandler(entry_points=[CommandHandler('batch', batch_start)], states={GET_LINKS: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_links)], GET_BATCH_DESTINATION: [MessageHandler(filters.ALL & ~filters.COMMAND, get_batch_destination)]}, fallbacks=[cancel_handler])
     clone_conv = ConversationHandler(entry_points=[CommandHandler('clone', clone_start)], states={CLONE_SOURCE: [MessageHandler(filters.ALL & ~filters.COMMAND, clone_get_source)], CLONE_DEST: [MessageHandler(filters.ALL & ~filters.COMMAND, clone_get_dest)], CLONE_RESTRICTED: [CallbackQueryHandler(clone_set_restricted, pattern="^clone_restricted:"), MessageHandler(filters.TEXT & ~filters.COMMAND, clone_process_skip)]}, fallbacks=[cancel_handler])
     application.add_handler(conv_handler)
