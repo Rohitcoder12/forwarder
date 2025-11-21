@@ -161,12 +161,16 @@ async def handle_new_message(event):
 
         # Text Filters (Blacklist/Whitelist)
         blacklist = filters_doc.get("blacklist_words")
-        if blacklist and any(word.lower() in msg_text.lower() for word in blacklist.splitlines() if word.strip()): continue
+        if blacklist:
+            # Handle cases where blacklist might be empty string in DB
+            blacklist_lines = [w for w in blacklist.splitlines() if w.strip()]
+            if any(word.lower() in msg_text.lower() for word in blacklist_lines): continue
         
         whitelist = filters_doc.get("whitelist_words")
         if whitelist:
+             whitelist_lines = [w for w in whitelist.splitlines() if w.strip()]
              # If whitelist exists, message MUST contain at least one word
-             if not any(word.lower() in msg_text.lower() for word in whitelist.splitlines() if word.strip()):
+             if whitelist_lines and not any(word.lower() in msg_text.lower() for word in whitelist_lines):
                  continue
 
         # Modifications
@@ -506,7 +510,8 @@ async def save_setting_text(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         current_lines = [line.strip() for line in current_value.split('\n') if line.strip()]
         
         if user_text == '/clear' or user_text == '/skip':
-            new_value = None
+            # FIX: Use empty string "" instead of None to prevent errors next time
+            new_value = "" 
             msg = "🗑️ List cleared successfully."
         
         elif user_text.startswith('-'):
@@ -613,13 +618,202 @@ async def auto_save_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if path and os.path.exists(path): os.remove(path)
         if thumb_path and os.path.exists(thumb_path): os.remove(thumb_path)
 
+# --- Clone Handler ---
+async def clone_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.message.reply_text("📋 *Clone Channel Mode*\n\n📥 Send source channel ID or forward a message from source channel.\n\nOr /cancel to abort.", parse_mode='Markdown')
+    return CLONE_SOURCE
+
+async def clone_get_source(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.message.forward_origin: source_id = update.message.forward_origin.chat.id
+    else:
+        parsed = parse_chat_ids(update.message.text)
+        source_id = parsed[0] if parsed else None
+    if not source_id: await update.message.reply_text("❌ Invalid source. Try again or /cancel."); return CLONE_SOURCE
+    context.user_data['clone_source'] = source_id
+    await update.message.reply_text("✅ Source set!\n\n📤 Now send destination channel ID or forward a message from destination.\n\nOr /cancel.")
+    return CLONE_DEST
+
+async def clone_get_dest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.message.forward_origin: dest_id = update.message.forward_origin.chat.id
+    else:
+        parsed = parse_chat_ids(update.message.text)
+        dest_id = parsed[0] if parsed else None
+    if not dest_id: await update.message.reply_text("❌ Invalid destination. Try again or /cancel."); return CLONE_DEST
+    context.user_data['clone_dest'] = dest_id
+    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Forwarding Allowed", callback_data="clone_restricted:false")], [InlineKeyboardButton("🚫 Restricted (Download & Upload)", callback_data="clone_restricted:true")]])
+    await update.message.reply_text("⚙️ *Channel Settings*\n\nIs forwarding restricted in the source channel?", reply_markup=keyboard, parse_mode='Markdown')
+    return CLONE_RESTRICTED
+
+async def clone_set_restricted(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    restricted = query.data.split(':')[1] == 'true'
+    context.user_data['clone_restricted'] = restricted
+    source_id = context.user_data['clone_source']
+    dest_id = context.user_data['clone_dest']
+    await query.edit_message_text("⏳ Starting clone process...\n\nSend message links to skip specific messages, or send 'done' to start cloning.")
+    return await clone_get_skip_links(update, context)
+
+async def clone_get_skip_links(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data.setdefault('clone_skip_ids', [])
+    return CLONE_RESTRICTED
+
+async def clone_process_skip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.message.text.lower() == 'done':
+        return await clone_execute(update, context)
+    match = re.match(r"https?://t\.me/(c/)?(\w+)/(\d+)", update.message.text)
+    if match:
+        msg_id = int(match.group(3))
+        context.user_data['clone_skip_ids'].append(msg_id)
+        await update.message.reply_text(f"✅ Message {msg_id} will be skipped.\n\nSend more links or 'done' to start.")
+        return CLONE_RESTRICTED
+    await update.message.reply_text("❌ Invalid link. Send a valid message link or 'done'.")
+    return CLONE_RESTRICTED
+
+async def clone_execute(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    source_id = context.user_data['clone_source']
+    dest_id = context.user_data['clone_dest']
+    restricted = context.user_data.get('clone_restricted', False)
+    skip_ids = set(context.user_data.get('clone_skip_ids', []))
+    status_msg = await update.message.reply_text("⏳ Fetching all messages from source channel...")
+    count, errors, skipped = 0, 0, 0
+    try:
+        all_messages = []
+        async for message in client.iter_messages(source_id):
+            if message.id not in skip_ids:
+                all_messages.append(message)
+            else:
+                skipped += 1
+        all_messages.reverse()
+        total = len(all_messages)
+        await status_msg.edit_text(f"✅ Found {total} messages to clone (skipped {skipped}). Starting...")
+        for idx, message in enumerate(all_messages):
+            try:
+                if (idx + 1) % 10 == 0:
+                    await status_msg.edit_text(f"⏳ Progress: {idx+1}/{total} messages processed...")
+                if restricted:
+                    if message.grouped_id:
+                        album = [m for m in all_messages[idx:] if m and m.grouped_id == message.grouped_id]
+                        album_paths, thumb_path = [], None
+                        try:
+                            for j, msg in enumerate(album):
+                                path = await msg.download_media(file=f"temp_clone_{msg.id}_{j}")
+                                if path: album_paths.append(path)
+                                if not thumb_path and msg.video: thumb_path = await generate_thumbnail(path)
+                            if album_paths:
+                                await client.send_file(dest_id, album_paths, caption=album[0].text, thumb=thumb_path)
+                                count += len(album)
+                        except Exception as e:
+                            LOGGER.error(f"Clone album error: {e}")
+                            errors += len(album)
+                        finally:
+                            for path in album_paths:
+                                if path and os.path.exists(path): os.remove(path)
+                            if thumb_path and os.path.exists(thumb_path): os.remove(thumb_path)
+                    else:
+                        path, thumb_path = None, None
+                        try:
+                            if message.media:
+                                path = await message.download_media(file=f"temp_clone_{message.id}")
+                                if message.video: thumb_path = await generate_thumbnail(path)
+                            await client.send_file(dest_id, path or message.text, caption=message.text, thumb=thumb_path, link_preview=False)
+                            count += 1
+                        except Exception as e:
+                            LOGGER.error(f"Clone message error: {e}")
+                            errors += 1
+                        finally:
+                            if path and os.path.exists(path): os.remove(path)
+                            if thumb_path and os.path.exists(thumb_path): os.remove(thumb_path)
+                else:
+                    await client.forward_messages(dest_id, message.id, source_id)
+                    count += 1
+                await asyncio.sleep(2)
+            except FloodWaitError as e:
+                await status_msg.edit_text(f"⏳ Rate limited. Waiting {e.seconds} seconds...")
+                await asyncio.sleep(e.seconds)
+            except Exception as e:
+                LOGGER.error(f"Error cloning message {message.id}: {e}")
+                errors += 1
+    except Exception as e:
+        await status_msg.edit_text(f"❌ Critical error: {e}")
+        return ConversationHandler.END
+    await status_msg.edit_text(f"✅ *Clone complete!*\n\n✅ Successful: {count}\n❌ Failed: {errors}\n⏭️ Skipped: {skipped}", parse_mode='Markdown')
+    context.user_data.clear()
+    return ConversationHandler.END
+
+# --- Batch Handler ---
+async def batch_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.message.reply_text("📦 *Batch Copy Mode*\n\nSend start and end message links (one per line).\n\nFormat:\n`https://t.me/c/CHANNEL_ID/START_MSG_ID`\n`https://t.me/c/CHANNEL_ID/END_MSG_ID`\n\nOr /cancel to abort.", parse_mode='Markdown')
+    return GET_LINKS
+
+def parse_message_link(link: str):
+    match = re.match(r"https?://t\.me/c/(\d+)/(\d+)", link)
+    return (int("-100" + match.group(1)), int(match.group(2))) if match else (None, None)
+
+async def get_links(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    links = update.message.text.split()
+    if len(links) != 2: await update.message.reply_text("❌ Please provide exactly two links or /cancel."); return GET_LINKS
+    start_channel, start_msg_id = parse_message_link(links[0]); end_channel, end_msg_id = parse_message_link(links[1])
+    if not all([start_channel, start_msg_id, end_channel, end_msg_id]) or start_channel != end_channel:
+        await update.message.reply_text("❌ Invalid or mismatched links. Try again or /cancel."); return GET_LINKS
+    context.user_data['batch_info'] = {'channel_id': start_channel, 'start_id': start_msg_id, 'end_id': end_msg_id}
+    await update.message.reply_text("✅ Links validated!\n\n📤 Now send destination chat ID or forward a message from destination.\n\nOr /cancel.")
+    return GET_BATCH_DESTINATION
+
+async def get_batch_destination(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.message.forward_origin: dest_id = update.message.forward_origin.chat.id
+    else:
+        parsed = parse_chat_ids(update.message.text)
+        dest_id = parsed[0] if parsed else None
+    if not dest_id: await update.message.reply_text("❌ Invalid destination. Try again or /cancel."); return GET_BATCH_DESTINATION
+    info = context.user_data['batch_info']
+    status_msg = await update.message.reply_text(f"⏳ Fetching messages from {info['start_id']} to {info['end_id']}...")
+    count, errors = 0, 0
+    try:
+        messages_to_copy = await client.get_messages(info['channel_id'], ids=range(info['start_id'], info['end_id'] + 1))
+        existing_messages = [m for m in messages_to_copy if m is not None]
+        total_found = len(existing_messages)
+        await status_msg.edit_text(f"✅ Found {total_found} messages. Starting copy process...")
+        i = 0
+        while i < total_found:
+            message = existing_messages[i]
+            if (i + 1) % 5 == 0: await status_msg.edit_text(f"⏳ Progress: {i+1}/{total_found} messages processed...")
+            if message.grouped_id:
+                album = [m for m in existing_messages[i:] if m and m.grouped_id == message.grouped_id]
+                album_paths, thumb_path = [], None
+                try:
+                    for j, msg in enumerate(album):
+                        path = await msg.download_media(file=f"temp_batch_{msg.id}_{j}")
+                        album_paths.append(path)
+                        if not thumb_path and msg.video: thumb_path = await generate_thumbnail(path)
+                    await client.send_file(dest_id, album_paths, caption=album[0].text, thumb=thumb_path)
+                    count += len(album)
+                except Exception as e:
+                    LOGGER.error(f"Batch album copy error for group {message.grouped_id}: {e}")
+                    errors += len(album)
+                finally:
+                    for path in album_paths:
+                        if os.path.exists(path): os.remove(path)
+                    if thumb_path and os.path.exists(thumb_path): os.remove(thumb_path)
+                i += len(album)
+            else:
+                await process_single_message(dest_id, message, message.text)
+                count += 1
+                i += 1
+            await asyncio.sleep(2)
+    except Exception as e:
+        await status_msg.edit_text(f"❌ Critical error during batch: {e}")
+        return ConversationHandler.END
+    await status_msg.edit_text(f"✅ *Batch complete!*\n\n✅ Successful: {count}\n❌ Failed: {errors}", parse_mode='Markdown')
+    return ConversationHandler.END
+
 # --- Main ---
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 *Welcome!*\n\n/forward - Manage tasks\n/help - Show help", parse_mode='Markdown')
+    await update.message.reply_text("👋 *Welcome!*\n\n/forward - Manage tasks\n/batch - Batch Copy\n/clone - Clone Channel\n/help - Show help", parse_mode='Markdown')
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("📚 *Help*\n\nUse /forward to create tasks.\nUse `-word` to remove items from lists.", parse_mode='Markdown')
+    await update.message.reply_text("📚 *Help*\n\nUse /forward to create tasks.\nUse `-word` to remove items from lists.\nUse `/clear` to empty a list.", parse_mode='Markdown')
 
 async def main():
     global MY_ID
@@ -627,7 +821,10 @@ async def main():
 
     cancel_handler = CommandHandler('cancel', cancel)
     
-    # FIX: Added CommandHandler('forward') inside the states so it doesn't get stuck
+    # --- CRITICAL FIX: allow_reentry=True ---
+    # This ensures that if you type /forward while inside a menu, it restarts correctly.
+    # We also changed filters.TEXT to allow commands like /clear to pass through to the handler.
+    
     conv_handler = ConversationHandler(
         entry_points=[
             CommandHandler("forward", forward_command_handler),
@@ -636,12 +833,12 @@ async def main():
         ],
         states={
             MAIN_MENU: [
-                CommandHandler("forward", forward_command_handler), # Fix stuck issue
+                CommandHandler("forward", forward_command_handler),
                 CallbackQueryHandler(new_task_start, pattern="^new_task_start$"),
                 CallbackQueryHandler(callback_query_handler, pattern="^(toggle_status|delete_confirm|delete_execute|settings_menu|settings_toggle_beautify|settings_toggle_filter|settings_toggle_blockme|view_stats|back_to_main_menu)")
             ],
             SETTINGS_MENU: [
-                CommandHandler("forward", forward_command_handler), # Fix stuck issue
+                CommandHandler("forward", forward_command_handler),
                 CallbackQueryHandler(edit_setting_ask, pattern="^settings_edit_"),
                 CallbackQueryHandler(forward_command_handler, pattern="^back_to_main_menu$"),
                 CallbackQueryHandler(callback_query_handler, pattern="^(settings_toggle_beautify|settings_toggle_filter|settings_toggle_blockme|settings_menu)")
@@ -650,18 +847,44 @@ async def main():
             ASK_SOURCE: [MessageHandler(filters.ALL & ~filters.COMMAND, get_source)],
             ASK_DESTINATION: [MessageHandler(filters.ALL & ~filters.COMMAND, get_destination)],
             
-            ASK_FOOTER: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_footer), CallbackQueryHandler(callback_query_handler, pattern="^settings_menu:")],
-            ASK_REPLACE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_replace_rules), CallbackQueryHandler(callback_query_handler, pattern="^settings_menu:")],
-            ASK_REMOVE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_remove_texts), CallbackQueryHandler(callback_query_handler, pattern="^settings_menu:")],
-            ASK_BLACKLIST: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_blacklist), CallbackQueryHandler(callback_query_handler, pattern="^settings_menu:")],
-            ASK_WHITELIST: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_whitelist), CallbackQueryHandler(callback_query_handler, pattern="^settings_menu:")],
-            ASK_DELAY: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_delay), CallbackQueryHandler(callback_query_handler, pattern="^settings_menu:")]
+            # FIX: Allowed commands in these handlers so /clear is not filtered out
+            ASK_FOOTER: [MessageHandler(filters.TEXT, get_footer), CallbackQueryHandler(callback_query_handler, pattern="^settings_menu:")],
+            ASK_REPLACE: [MessageHandler(filters.TEXT, get_replace_rules), CallbackQueryHandler(callback_query_handler, pattern="^settings_menu:")],
+            ASK_REMOVE: [MessageHandler(filters.TEXT, get_remove_texts), CallbackQueryHandler(callback_query_handler, pattern="^settings_menu:")],
+            ASK_BLACKLIST: [MessageHandler(filters.TEXT, get_blacklist), CallbackQueryHandler(callback_query_handler, pattern="^settings_menu:")],
+            ASK_WHITELIST: [MessageHandler(filters.TEXT, get_whitelist), CallbackQueryHandler(callback_query_handler, pattern="^settings_menu:")],
+            ASK_DELAY: [MessageHandler(filters.TEXT, get_delay), CallbackQueryHandler(callback_query_handler, pattern="^settings_menu:")]
         },
         fallbacks=[cancel_handler],
-        per_message=False
+        per_message=False,
+        allow_reentry=True # This fixes the stuck /forward issue
+    )
+
+    batch_conv = ConversationHandler(
+        entry_points=[CommandHandler('batch', batch_start)], 
+        states={
+            GET_LINKS: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_links)], 
+            GET_BATCH_DESTINATION: [MessageHandler(filters.ALL & ~filters.COMMAND, get_batch_destination)]
+        }, 
+        fallbacks=[cancel_handler]
+    )
+    
+    clone_conv = ConversationHandler(
+        entry_points=[CommandHandler('clone', clone_start)], 
+        states={
+            CLONE_SOURCE: [MessageHandler(filters.ALL & ~filters.COMMAND, clone_get_source)], 
+            CLONE_DEST: [MessageHandler(filters.ALL & ~filters.COMMAND, clone_get_dest)], 
+            CLONE_RESTRICTED: [
+                CallbackQueryHandler(clone_set_restricted, pattern="^clone_restricted:"), 
+                MessageHandler(filters.TEXT & ~filters.COMMAND, clone_process_skip)
+            ]
+        }, 
+        fallbacks=[cancel_handler]
     )
 
     application.add_handler(conv_handler)
+    application.add_handler(batch_conv)
+    application.add_handler(clone_conv)
     application.add_handler(MessageHandler(filters.Regex(r'https?://t\.me/') & filters.TEXT, auto_save_handler))
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
