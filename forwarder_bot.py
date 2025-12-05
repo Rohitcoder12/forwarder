@@ -89,9 +89,41 @@ def update_stats(task_id: str, success: bool = True):
         )
     except Exception as e: LOGGER.error(f"Failed to update stats: {e}")
 
+def apply_text_modifications(text, mods):
+    if not text: text = ""
+    
+    # 1. Remove Texts
+    if mods.get("remove_texts"):
+        remove_list = [l.strip() for l in mods["remove_texts"].splitlines() if l.strip()]
+        text = "\n".join([line for line in text.splitlines() if line.strip() not in remove_list])
+    
+    # 2. Replace Rules
+    if mods.get("replace_rules"):
+        for rule in mods["replace_rules"].splitlines():
+            if '=>' in rule: 
+                find, repl = rule.split('=>', 1)
+                text = text.replace(find.strip(), repl.strip())
+    
+    # 3. Beautiful Captions
+    if mods.get("beautiful_captions"):
+        new_caption = create_beautiful_caption(text)
+        if new_caption: text = new_caption
+    
+    # Cleanup empty lines
+    if text: 
+        text = re.sub(r'\n{3,}', '\n\n', text).strip()
+    
+    # 4. Footer
+    if mods.get("footer_text"): 
+        text = f"{text or ''}\n\n{mods['footer_text']}"
+        
+    return text
+
 # --- Telethon Client (Userbot) ---
 
-ALBUM_HANDLING_TASKS = {}
+# Global buffers for album handling
+ALBUM_BUFFER = {} # Stores messages: {grouped_id: [msg1, msg2]}
+ALBUM_LOCKS = {}  # Stores async tasks: {grouped_id: Task}
 
 async def process_single_message(dest_id: int, message: Message, caption: str, task_id: str = None):
     path, thumb_path = None, None
@@ -99,9 +131,7 @@ async def process_single_message(dest_id: int, message: Message, caption: str, t
         if message.media:
             LOGGER.info(f"⏳ Downloading media for message {message.id}...")
             path = await message.download_media(file=f"temp_single_{message.id}")
-            LOGGER.info(f"✅ Download complete: {path}")
             
-            # Check if it's a video to generate thumb
             is_video = message.video or (message.document and message.file.mime_type.startswith('video/'))
             if is_video: 
                 thumb_path = await generate_thumbnail(path)
@@ -118,31 +148,57 @@ async def process_single_message(dest_id: int, message: Message, caption: str, t
         if path and os.path.exists(path): os.remove(path)
         if thumb_path and os.path.exists(thumb_path): os.remove(thumb_path)
 
-async def process_album(task_id, group_id, dest_ids, caption):
-    await asyncio.sleep(3)
-    album_key = f"{task_id}_{group_id}"
-    messages = ALBUM_HANDLING_TASKS.pop(album_key, [])
+async def process_album_batch(task_id, group_id, dest_ids, mods):
+    # Wait for all parts of the album to arrive
+    await asyncio.sleep(5)
+    
+    # Retrieve messages and clear lock
+    messages = ALBUM_BUFFER.pop(group_id, [])
+    if group_id in ALBUM_LOCKS: del ALBUM_LOCKS[group_id]
+    
     if not messages: return
     
-    paths, thumb_path = [], None
+    # Sort messages by ID to keep order
+    messages.sort(key=lambda x: x.id)
+    LOGGER.info(f"📦 Processing Album: {len(messages)} items found.")
+
+    paths = []
+    thumb_path = None
+    
+    # 1. Find Caption (Check ALL messages in album)
+    raw_caption = ""
+    for msg in messages:
+        if msg.text:
+            raw_caption = msg.text
+            break # Use the first caption found
+            
+    # 2. Apply Modifications
+    final_caption = apply_text_modifications(raw_caption, mods)
+
     try:
-        LOGGER.info(f"⏳ Processing album with {len(messages)} items...")
+        # 3. Download All Media
         for i, msg in enumerate(messages):
             path = await msg.download_media(file=f"temp_{task_id}_{group_id}_{i}")
             paths.append(path)
             
+            # Generate thumb from the first video found
             is_video = msg.video or (msg.document and msg.file.mime_type.startswith('video/'))
             if not thumb_path and is_video: 
                 thumb_path = await generate_thumbnail(path)
         
+        # 4. Send Album
         for dest_id in dest_ids:
-            await client.send_file(dest_id, paths, caption=caption, thumb=thumb_path, link_preview=False)
+            LOGGER.info(f"📤 Sending Album to {dest_id}...")
+            await client.send_file(dest_id, paths, caption=final_caption, thumb=thumb_path, link_preview=False)
+            
         update_stats(task_id, success=True)
         LOGGER.info("✅ Album forwarded successfully.")
+        
     except Exception as e:
         LOGGER.error(f"Error processing album {group_id}: {e}")
         update_stats(task_id, success=False)
     finally:
+        # Cleanup
         for path in paths:
             if os.path.exists(path): os.remove(path)
         if thumb_path and os.path.exists(thumb_path): os.remove(thumb_path)
@@ -155,14 +211,6 @@ async def handle_new_message(event):
     message = event.message
     chat_id = event.chat_id
 
-    # --- DEBUG: Detect Message Type ---
-    msg_type = "Text"
-    if message.photo: msg_type = "Photo"
-    elif message.video: msg_type = "Video"
-    elif message.document: msg_type = f"Document ({message.file.mime_type})"
-    
-    LOGGER.info(f"📨 New {msg_type} detected in Chat ID: {chat_id}")
-
     # --- SMART ID MATCHING ---
     clean_id = int(str(chat_id).replace("-100", ""))
     possible_ids = [chat_id, clean_id, int(f"-100{clean_id}")]
@@ -172,83 +220,60 @@ async def handle_new_message(event):
         "status": "active"
     }))
 
-    if not active_tasks:
-        return
+    if not active_tasks: return
 
     for task in active_tasks:
         # Block Me Check
         block_me = task.get("settings", {}).get("block_me", False)
         if block_me and message.sender_id == task.get("owner_id") and not message.reply_to:
-            LOGGER.info("⚠️ Skipped: Block Me is enabled.")
             continue
 
         # Filters
         filters_doc = task.get("filters", {})
         msg_text = message.text or ""
-        
-        # Robust Video Detection
         is_video = message.video or (message.document and message.file.mime_type.startswith('video/'))
         
-        if filters_doc.get("block_videos") and is_video:
-            LOGGER.info("⚠️ Skipped: Video blocked by filter.")
-            continue
-        if filters_doc.get("block_photos") and message.photo:
-            continue
-        # Block docs ONLY if they are not videos
-        if filters_doc.get("block_documents") and message.document and not is_video:
-            continue
-        if filters_doc.get("block_text") and not message.media:
-            continue
+        if filters_doc.get("block_videos") and is_video: continue
+        if filters_doc.get("block_photos") and message.photo: continue
+        if filters_doc.get("block_documents") and message.document and not is_video: continue
+        if filters_doc.get("block_text") and not message.media: continue
 
         # Text Filters
         blacklist = filters_doc.get("blacklist_words")
         if blacklist:
             blacklist_lines = [w for w in blacklist.splitlines() if w.strip()]
-            if any(word.lower() in msg_text.lower() for word in blacklist_lines): 
-                LOGGER.info("⚠️ Skipped: Blacklisted word.")
-                continue
+            if any(word.lower() in msg_text.lower() for word in blacklist_lines): continue
         
         whitelist = filters_doc.get("whitelist_words")
         if whitelist:
              whitelist_lines = [w for w in whitelist.splitlines() if w.strip()]
-             if whitelist_lines and not any(word.lower() in msg_text.lower() for word in whitelist_lines):
-                 LOGGER.info("⚠️ Skipped: Missing whitelist word.")
-                 continue
+             if whitelist_lines and not any(word.lower() in msg_text.lower() for word in whitelist_lines): continue
 
-        # Modifications
+        # Get Modifications & Destinations
         mods = task.get("modifications", {})
-        final_caption = msg_text
-        
-        if mods.get("remove_texts"):
-            remove_list = [l.strip() for l in mods["remove_texts"].splitlines() if l.strip()]
-            final_caption = "\n".join([line for line in final_caption.splitlines() if line.strip() not in remove_list])
-            
-        if mods.get("replace_rules"):
-            for rule in mods["replace_rules"].splitlines():
-                if '=>' in rule: 
-                    find, repl = rule.split('=>', 1)
-                    final_caption = final_caption.replace(find.strip(), repl.strip())
-                    
-        if mods.get("beautiful_captions"):
-            new_caption = create_beautiful_caption(final_caption)
-            if new_caption: final_caption = new_caption
-            
-        if final_caption: 
-            final_caption = re.sub(r'\n{3,}', '\n\n', final_caption).strip()
-            
-        if mods.get("footer_text"): 
-            final_caption = f"{final_caption or ''}\n\n{mods['footer_text']}"
-
-        # Sending
         dest_ids = task.get("destination_ids", [])
         
+        # --- ALBUM HANDLING LOGIC ---
         if message.grouped_id:
-            album_key = f"{task['_id']}_{message.grouped_id}"
-            if album_key not in ALBUM_HANDLING_TASKS:
-                ALBUM_HANDLING_TASKS[album_key] = []
-                asyncio.create_task(process_album(task['_id'], message.grouped_id, dest_ids, final_caption))
-            ALBUM_HANDLING_TASKS[album_key].append(message)
+            group_id = message.grouped_id
+            
+            # 1. Add message to buffer
+            if group_id not in ALBUM_BUFFER:
+                ALBUM_BUFFER[group_id] = []
+            ALBUM_BUFFER[group_id].append(message)
+            
+            # 2. Start timer if not already running for this group
+            if group_id not in ALBUM_LOCKS:
+                LOGGER.info(f"📦 New Album detected (ID: {group_id}). Waiting for parts...")
+                ALBUM_LOCKS[group_id] = asyncio.create_task(
+                    process_album_batch(task['_id'], group_id, dest_ids, mods)
+                )
+            # Stop processing this message here; the batch task will handle it
+            continue 
+            
         else:
+            # Process Single Message
+            final_caption = apply_text_modifications(msg_text, mods)
             for dest_id in dest_ids:
                 await process_single_message(dest_id, message, final_caption, task['_id'])
             
@@ -590,7 +615,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await forward_command_handler(update, context, from_cancel=True)
     return ConversationHandler.END
 
-# --- Auto Save & Clone (Abbreviated for brevity, same logic) ---
+# --- Auto Save & Clone ---
 async def auto_save_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message_text = update.message.text
     match = re.match(r"https?://t\.me/(c/)?(\w+)/(\d+)", message_text)
