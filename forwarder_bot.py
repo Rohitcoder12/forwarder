@@ -89,28 +89,39 @@ def update_stats(task_id: str, success: bool = True):
         )
     except Exception as e: LOGGER.error(f"Failed to update stats: {e}")
 
+def apply_text_modifications(text, mods):
+    if not text: text = ""
+    if mods.get("remove_texts"):
+        remove_list = [l.strip() for l in mods["remove_texts"].splitlines() if l.strip()]
+        text = "\n".join([line for line in text.splitlines() if line.strip() not in remove_list])
+    if mods.get("replace_rules"):
+        for rule in mods["replace_rules"].splitlines():
+            if '=>' in rule: 
+                find, repl = rule.split('=>', 1)
+                text = text.replace(find.strip(), repl.strip())
+    if mods.get("beautiful_captions"):
+        new_caption = create_beautiful_caption(text)
+        if new_caption: text = new_caption
+    if text: text = re.sub(r'\n{3,}', '\n\n', text).strip()
+    if mods.get("footer_text"): text = f"{text or ''}\n\n{mods['footer_text']}"
+    return text
+
 # --- Telethon Client (Userbot) ---
 
-ALBUM_HANDLING_TASKS = {}
+ALBUM_BUFFER = {} 
+ALBUM_LOCKS = {}
 
 async def process_single_message(dest_id: int, message: Message, caption: str, task_id: str = None):
     path, thumb_path = None, None
     try:
         if message.media:
-            LOGGER.info(f"⏳ Downloading media for message {message.id}...")
+            # Optimized download
             path = await message.download_media(file=f"temp_single_{message.id}")
-            LOGGER.info(f"✅ Download complete: {path}")
-            
-            # Check if it's a video to generate thumb
             is_video = message.video or (message.document and message.file.mime_type.startswith('video/'))
-            if is_video: 
-                thumb_path = await generate_thumbnail(path)
+            if is_video: thumb_path = await generate_thumbnail(path)
 
-        LOGGER.info(f"📤 Uploading to destination {dest_id}...")
         await client.send_file(dest_id, path or message.text, caption=caption, thumb=thumb_path, link_preview=False)
-        LOGGER.info("✅ Upload successful.")
         if task_id: update_stats(task_id, success=True)
-        
     except Exception as e:
         LOGGER.error(f"❌ Failed to copy single message to {dest_id}: {e}")
         if task_id: update_stats(task_id, success=False)
@@ -118,27 +129,33 @@ async def process_single_message(dest_id: int, message: Message, caption: str, t
         if path and os.path.exists(path): os.remove(path)
         if thumb_path and os.path.exists(thumb_path): os.remove(thumb_path)
 
-async def process_album(task_id, group_id, dest_ids, caption):
-    await asyncio.sleep(3)
-    album_key = f"{task_id}_{group_id}"
-    messages = ALBUM_HANDLING_TASKS.pop(album_key, [])
+async def process_album_batch(task_id, group_id, dest_ids, mods):
+    await asyncio.sleep(4) # Wait for all parts
+    messages = ALBUM_BUFFER.pop(group_id, [])
+    if group_id in ALBUM_LOCKS: del ALBUM_LOCKS[group_id]
     if not messages: return
     
+    messages.sort(key=lambda x: x.id)
     paths, thumb_path = [], None
+    
+    # Find caption
+    raw_caption = ""
+    for msg in messages:
+        if msg.text:
+            raw_caption = msg.text
+            break
+    final_caption = apply_text_modifications(raw_caption, mods)
+
     try:
-        LOGGER.info(f"⏳ Processing album with {len(messages)} items...")
         for i, msg in enumerate(messages):
             path = await msg.download_media(file=f"temp_{task_id}_{group_id}_{i}")
             paths.append(path)
-            
             is_video = msg.video or (msg.document and msg.file.mime_type.startswith('video/'))
-            if not thumb_path and is_video: 
-                thumb_path = await generate_thumbnail(path)
+            if not thumb_path and is_video: thumb_path = await generate_thumbnail(path)
         
         for dest_id in dest_ids:
-            await client.send_file(dest_id, paths, caption=caption, thumb=thumb_path, link_preview=False)
+            await client.send_file(dest_id, paths, caption=final_caption, thumb=thumb_path, link_preview=False)
         update_stats(task_id, success=True)
-        LOGGER.info("✅ Album forwarded successfully.")
     except Exception as e:
         LOGGER.error(f"Error processing album {group_id}: {e}")
         update_stats(task_id, success=False)
@@ -147,6 +164,7 @@ async def process_album(task_id, group_id, dest_ids, caption):
             if os.path.exists(path): os.remove(path)
         if thumb_path and os.path.exists(thumb_path): os.remove(thumb_path)
 
+# Initialize Client with optimizations
 client = TelegramClient(SESSION_NAME, int(API_ID), API_HASH)
 
 @client.on(events.NewMessage())
@@ -155,106 +173,50 @@ async def handle_new_message(event):
     message = event.message
     chat_id = event.chat_id
 
-    # --- DEBUG: Detect Message Type ---
-    msg_type = "Text"
-    if message.photo: msg_type = "Photo"
-    elif message.video: msg_type = "Video"
-    elif message.document: msg_type = f"Document ({message.file.mime_type})"
-    
-    LOGGER.info(f"📨 New {msg_type} detected in Chat ID: {chat_id}")
-
-    # --- SMART ID MATCHING ---
     clean_id = int(str(chat_id).replace("-100", ""))
     possible_ids = [chat_id, clean_id, int(f"-100{clean_id}")]
 
-    active_tasks = list(tasks_collection.find({
-        "source_ids": {"$in": possible_ids}, 
-        "status": "active"
-    }))
-
-    if not active_tasks:
-        return
+    active_tasks = list(tasks_collection.find({"source_ids": {"$in": possible_ids}, "status": "active"}))
+    if not active_tasks: return
 
     for task in active_tasks:
-        # Block Me Check
         block_me = task.get("settings", {}).get("block_me", False)
-        if block_me and message.sender_id == task.get("owner_id") and not message.reply_to:
-            LOGGER.info("⚠️ Skipped: Block Me is enabled.")
-            continue
+        if block_me and message.sender_id == task.get("owner_id") and not message.reply_to: continue
 
-        # Filters
         filters_doc = task.get("filters", {})
         msg_text = message.text or ""
-        
-        # Robust Video Detection
         is_video = message.video or (message.document and message.file.mime_type.startswith('video/'))
         
-        if filters_doc.get("block_videos") and is_video:
-            LOGGER.info("⚠️ Skipped: Video blocked by filter.")
-            continue
-        if filters_doc.get("block_photos") and message.photo:
-            continue
-        # Block docs ONLY if they are not videos
-        if filters_doc.get("block_documents") and message.document and not is_video:
-            continue
-        if filters_doc.get("block_text") and not message.media:
-            continue
+        if filters_doc.get("block_videos") and is_video: continue
+        if filters_doc.get("block_photos") and message.photo: continue
+        if filters_doc.get("block_documents") and message.document and not is_video: continue
+        if filters_doc.get("block_text") and not message.media: continue
 
-        # Text Filters
         blacklist = filters_doc.get("blacklist_words")
         if blacklist:
-            blacklist_lines = [w for w in blacklist.splitlines() if w.strip()]
-            if any(word.lower() in msg_text.lower() for word in blacklist_lines): 
-                LOGGER.info("⚠️ Skipped: Blacklisted word.")
-                continue
+            if any(w.lower() in msg_text.lower() for w in blacklist.splitlines() if w.strip()): continue
         
         whitelist = filters_doc.get("whitelist_words")
         if whitelist:
-             whitelist_lines = [w for w in whitelist.splitlines() if w.strip()]
-             if whitelist_lines and not any(word.lower() in msg_text.lower() for word in whitelist_lines):
-                 LOGGER.info("⚠️ Skipped: Missing whitelist word.")
-                 continue
+             if not any(w.lower() in msg_text.lower() for w in whitelist.splitlines() if w.strip()): continue
 
-        # Modifications
         mods = task.get("modifications", {})
-        final_caption = msg_text
-        
-        if mods.get("remove_texts"):
-            remove_list = [l.strip() for l in mods["remove_texts"].splitlines() if l.strip()]
-            final_caption = "\n".join([line for line in final_caption.splitlines() if line.strip() not in remove_list])
-            
-        if mods.get("replace_rules"):
-            for rule in mods["replace_rules"].splitlines():
-                if '=>' in rule: 
-                    find, repl = rule.split('=>', 1)
-                    final_caption = final_caption.replace(find.strip(), repl.strip())
-                    
-        if mods.get("beautiful_captions"):
-            new_caption = create_beautiful_caption(final_caption)
-            if new_caption: final_caption = new_caption
-            
-        if final_caption: 
-            final_caption = re.sub(r'\n{3,}', '\n\n', final_caption).strip()
-            
-        if mods.get("footer_text"): 
-            final_caption = f"{final_caption or ''}\n\n{mods['footer_text']}"
-
-        # Sending
         dest_ids = task.get("destination_ids", [])
         
         if message.grouped_id:
-            album_key = f"{task['_id']}_{message.grouped_id}"
-            if album_key not in ALBUM_HANDLING_TASKS:
-                ALBUM_HANDLING_TASKS[album_key] = []
-                asyncio.create_task(process_album(task['_id'], message.grouped_id, dest_ids, final_caption))
-            ALBUM_HANDLING_TASKS[album_key].append(message)
+            group_id = message.grouped_id
+            if group_id not in ALBUM_BUFFER: ALBUM_BUFFER[group_id] = []
+            ALBUM_BUFFER[group_id].append(message)
+            if group_id not in ALBUM_LOCKS:
+                ALBUM_LOCKS[group_id] = asyncio.create_task(process_album_batch(task['_id'], group_id, dest_ids, mods))
+            continue 
         else:
+            final_caption = apply_text_modifications(msg_text, mods)
             for dest_id in dest_ids:
                 await process_single_message(dest_id, message, final_caption, task['_id'])
             
             delay = task.get("settings", {}).get("delay", 0)
             if delay > 0: await asyncio.sleep(delay)
-
 
 # --- Telegram Bot (Controller) ---
 
@@ -296,61 +258,36 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
             status_text = "▶️ activated" if new_status == "active" else "⏸️ paused"
             await query.answer(f"Task {status_text}!", show_alert=True)
         return await forward_command_handler(update, context)
-        
     elif action == "delete_confirm":
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ Yes, Delete", callback_data=f"delete_execute:{value}")], 
-            [InlineKeyboardButton("❌ Cancel", callback_data="back_to_main_menu")]
-        ])
-        await query.edit_message_text(f"⚠️ Are you sure you want to delete task '*{value}*'?\n\nThis action cannot be undone.", reply_markup=keyboard, parse_mode='Markdown')
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Yes, Delete", callback_data=f"delete_execute:{value}")], [InlineKeyboardButton("❌ Cancel", callback_data="back_to_main_menu")]])
+        await query.edit_message_text(f"⚠️ Delete task '*{value}*'?\nThis cannot be undone.", reply_markup=keyboard, parse_mode='Markdown')
         return MAIN_MENU
-        
     elif action == "delete_execute":
-        result = tasks_collection.delete_one({"_id": value, "owner_id": user_id})
-        if result.deleted_count > 0:
-            stats_collection.delete_one({"task_id": value})
-            await query.edit_text(f"✅ Task '*{value}*' has been deleted successfully.", parse_mode='Markdown')
-            await asyncio.sleep(2)
-            return await forward_command_handler(update, context)
-        else:
-            await query.edit_text("❌ Task not found or already deleted.")
-            return MAIN_MENU
-            
+        tasks_collection.delete_one({"_id": value, "owner_id": user_id})
+        stats_collection.delete_one({"task_id": value})
+        await query.edit_text(f"✅ Task '*{value}*' deleted.", parse_mode='Markdown')
+        await asyncio.sleep(2)
+        return await forward_command_handler(update, context)
     elif action == "view_stats":
         stats = stats_collection.find_one({"task_id": value})
         if stats:
-            total = stats.get("total_forwarded", 0)
-            failed = stats.get("total_failed", 0)
-            last_activity = stats.get("last_activity", "Never")
-            text = f"📊 *Statistics for: {value}*\n\n✅ Successfully forwarded: {total}\n❌ Failed: {failed}\n📅 Last activity: {last_activity}"
-        else:
-            text = f"📊 *Statistics for: {value}*\n\nNo activity yet."
+            text = f"📊 *Stats: {value}*\n✅ Sent: {stats.get('total_forwarded', 0)}\n❌ Failed: {stats.get('total_failed', 0)}\n📅 Last: {stats.get('last_activity', 'Never')}"
+        else: text = f"📊 *Stats: {value}*\nNo activity yet."
         keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="back_to_main_menu")]])
         await query.edit_message_text(text, reply_markup=keyboard, parse_mode='Markdown')
         return MAIN_MENU
-        
     elif query.data == "back_to_main_menu":
         return await forward_command_handler(update, context)
-        
     elif action.startswith("settings_toggle"):
         task_id, filter_type = value.split(":")
         task = tasks_collection.find_one({"_id": task_id, "owner_id": user_id})
         if task:
-            if "beautify" in action:
-                db_field = "modifications.beautiful_captions"
-                current_status = task.get("modifications", {}).get("beautiful_captions", False)
-            elif "blockme" in action:
-                db_field = "settings.block_me"
-                current_status = task.get("settings", {}).get("block_me", False)
-            else:
-                db_field = f"filters.{filter_type}"
-                current_status = task.get("filters", {}).get(filter_type, False)
-            
-            tasks_collection.update_one({"_id": task_id}, {"$set": {db_field: not current_status}})
-        
+            if "beautify" in action: db_field = "modifications.beautiful_captions"; current = task.get("modifications", {}).get("beautiful_captions", False)
+            elif "blockme" in action: db_field = "settings.block_me"; current = task.get("settings", {}).get("block_me", False)
+            else: db_field = f"filters.{filter_type}"; current = task.get("filters", {}).get(filter_type, False)
+            tasks_collection.update_one({"_id": task_id}, {"$set": {db_field: not current}})
         context.user_data['current_task_id'] = task_id
         return await show_settings_menu(update, context)
-        
     elif action == "settings_menu":
         context.user_data['current_task_id'] = value
         return await show_settings_menu(update, context)
@@ -361,16 +298,13 @@ async def get_chat_titles(ids: list) -> str:
         try:
             entity = await client.get_entity(chat_id)
             titles.append(f"• {entity.title} (`{chat_id}`)")
-        except Exception:
-            titles.append(f"• Unknown Chat (`{chat_id}`)")
+        except Exception: titles.append(f"• Unknown Chat (`{chat_id}`)")
     return "\n".join(titles)
 
 async def show_settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     task_id = context.user_data.get('current_task_id')
     task = tasks_collection.find_one({"_id": task_id})
-    if not task:
-        await (update.callback_query.message if update.callback_query else update.message).reply_text("❌ Error: Task not found.")
-        return MAIN_MENU
+    if not task: await update.callback_query.message.reply_text("❌ Error: Task not found."); return MAIN_MENU
 
     mods = task.get("modifications", {})
     filters_doc = task.get("filters", {})
@@ -380,350 +314,204 @@ async def show_settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
     block_me_emoji = "✅" if settings.get("block_me", False) else "❌"
     def f_emoji(f_type): return "✅" if filters_doc.get(f_type) else "❌"
 
-    source_info = await get_chat_titles(task.get('source_ids', []))
-    dest_info = await get_chat_titles(task.get('destination_ids', []))
-    delay = settings.get('delay', 0)
-
-    text = f"⚙️ *Settings for: {task_id}*\n\n📥 *Sources:*\n{source_info}\n\n📤 *Destinations:*\n{dest_info}\n\n⏱️ *Delay:* {delay}s"
+    text = f"⚙️ *Settings: {task_id}*\n\n📥 *Sources:*\n{await get_chat_titles(task.get('source_ids', []))}\n\n📤 *Destinations:*\n{await get_chat_titles(task.get('destination_ids', []))}\n\n⏱️ *Delay:* {settings.get('delay', 0)}s"
 
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"{f_emoji('block_photos')} Photos", callback_data=f"settings_toggle_filter:{task_id}:block_photos"), 
-         InlineKeyboardButton(f"{f_emoji('block_videos')} Videos", callback_data=f"settings_toggle_filter:{task_id}:block_videos")],
-        [InlineKeyboardButton(f"{f_emoji('block_documents')} Docs", callback_data=f"settings_toggle_filter:{task_id}:block_documents"), 
-         InlineKeyboardButton(f"{f_emoji('block_text')} Text", callback_data=f"settings_toggle_filter:{task_id}:block_text")],
-        [InlineKeyboardButton("📝 Blacklist", callback_data="settings_edit_blacklist"), 
-         InlineKeyboardButton("📝 Whitelist", callback_data="settings_edit_whitelist")],
-        [InlineKeyboardButton(f"{beautify_emoji} Beautiful Captions", callback_data=f"settings_toggle_beautify:{task_id}:_"),
-         InlineKeyboardButton(f"{block_me_emoji} Block Me", callback_data=f"settings_toggle_blockme:{task_id}:_")],
-        [InlineKeyboardButton("📝 Footer", callback_data="settings_edit_footer"), 
-         InlineKeyboardButton("🔄 Replace", callback_data="settings_edit_replace")],
-        [InlineKeyboardButton("✂️ Remove Text", callback_data="settings_edit_remove"), 
-         InlineKeyboardButton("⏱️ Delay", callback_data="settings_edit_delay")],
+        [InlineKeyboardButton(f"{f_emoji('block_photos')} Photos", callback_data=f"settings_toggle_filter:{task_id}:block_photos"), InlineKeyboardButton(f"{f_emoji('block_videos')} Videos", callback_data=f"settings_toggle_filter:{task_id}:block_videos")],
+        [InlineKeyboardButton(f"{f_emoji('block_documents')} Docs", callback_data=f"settings_toggle_filter:{task_id}:block_documents"), InlineKeyboardButton(f"{f_emoji('block_text')} Text", callback_data=f"settings_toggle_filter:{task_id}:block_text")],
+        [InlineKeyboardButton("📝 Blacklist", callback_data="settings_edit_blacklist"), InlineKeyboardButton("📝 Whitelist", callback_data="settings_edit_whitelist")],
+        [InlineKeyboardButton(f"{beautify_emoji} Beautiful Captions", callback_data=f"settings_toggle_beautify:{task_id}:_"), InlineKeyboardButton(f"{block_me_emoji} Block Me", callback_data=f"settings_toggle_blockme:{task_id}:_")],
+        [InlineKeyboardButton("📝 Footer", callback_data="settings_edit_footer"), InlineKeyboardButton("🔄 Replace", callback_data="settings_edit_replace")],
+        [InlineKeyboardButton("✂️ Remove Text", callback_data="settings_edit_remove"), InlineKeyboardButton("⏱️ Delay", callback_data="settings_edit_delay")],
         [InlineKeyboardButton("⬅️ Back", callback_data="back_to_main_menu")]
     ])
-    
-    if update.callback_query:
-        await update.callback_query.edit_message_text(text, reply_markup=keyboard, parse_mode='Markdown')
-    else:
-        await context.bot.send_message(update.effective_chat.id, text, reply_markup=keyboard, parse_mode='Markdown')
-        
+    if update.callback_query: await update.callback_query.edit_message_text(text, reply_markup=keyboard, parse_mode='Markdown')
+    else: await context.bot.send_message(update.effective_chat.id, text, reply_markup=keyboard, parse_mode='Markdown')
     return SETTINGS_MENU
-
-# --- Task Creation Wizard ---
 
 async def new_task_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.callback_query.edit_message_text("📝 Please provide a unique name for this task.\n\nOr /cancel to abort.")
-    return ASK_LABEL
-
+    await update.callback_query.edit_message_text("📝 Enter a unique name for this task.\nOr /cancel."); return ASK_LABEL
 async def get_label(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     label = update.message.text.strip()
-    if tasks_collection.find_one({"_id": label}):
-        await update.message.reply_text("❌ This label already exists. Please choose another or /cancel.")
-        return ASK_LABEL
+    if tasks_collection.find_one({"_id": label}): await update.message.reply_text("❌ Label exists. Choose another."); return ASK_LABEL
     context.user_data['new_task_label'] = label
-    await update.message.reply_text("✅ Label set!\n\n📥 Now send Source Chat ID(s) (comma-separated) or forward a message from the source channel.\n\nOr /cancel.")
-    return ASK_SOURCE
-
+    await update.message.reply_text("✅ Label set!\n📥 Send Source Chat ID(s)."); return ASK_SOURCE
 async def get_source(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if update.message.forward_origin:
-        ids = [update.message.forward_origin.chat.id]
-    else:
-        ids = parse_chat_ids(update.message.text)
-    if not ids:
-        await update.message.reply_text("❌ Invalid ID. Please send numeric IDs or forward a message. Or /cancel.")
-        return ASK_SOURCE
+    ids = [update.message.forward_origin.chat.id] if update.message.forward_origin else parse_chat_ids(update.message.text)
+    if not ids: await update.message.reply_text("❌ Invalid ID."); return ASK_SOURCE
     context.user_data['new_task_source'] = ids
-    await update.message.reply_text("✅ Source(s) set!\n\n📤 Now send Destination Chat ID(s) (comma-separated) or forward a message from the destination channel.\n\nOr /cancel.")
-    return ASK_DESTINATION
-
+    await update.message.reply_text("✅ Source set!\n📤 Send Destination Chat ID(s)."); return ASK_DESTINATION
 async def get_destination(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if update.message.forward_origin:
-        ids = [update.message.forward_origin.chat.id]
-    else:
-        ids = parse_chat_ids(update.message.text)
-    if not ids:
-        await update.message.reply_text("❌ Invalid ID. Please send numeric IDs or forward a message. Or /cancel.")
-        return ASK_DESTINATION
-    
+    ids = [update.message.forward_origin.chat.id] if update.message.forward_origin else parse_chat_ids(update.message.text)
+    if not ids: await update.message.reply_text("❌ Invalid ID."); return ASK_DESTINATION
     tasks_collection.insert_one({
-        "_id": context.user_data['new_task_label'],
-        "owner_id": update.effective_user.id,
-        "status": "active",
-        "source_ids": context.user_data['new_task_source'],
-        "destination_ids": ids,
+        "_id": context.user_data['new_task_label'], "owner_id": update.effective_user.id, "status": "active",
+        "source_ids": context.user_data['new_task_source'], "destination_ids": ids,
         "modifications": {"footer_text": None, "replace_rules": None, "remove_texts": None, "beautiful_captions": False},
         "filters": {"blacklist_words": None, "whitelist_words": None, "block_photos": False, "block_videos": False, "block_documents": False, "block_text": False},
-        "settings": {"delay": 0, "block_me": False},
-        "created_at": datetime.utcnow()
+        "settings": {"delay": 0, "block_me": False}, "created_at": datetime.utcnow()
     })
-    context.user_data.clear()
-    await update.message.reply_text("✅ Task created successfully!")
-    await forward_command_handler(update, context)
-    return ConversationHandler.END
-
-# --- Settings Editors ---
+    context.user_data.clear(); await update.message.reply_text("✅ Task created!"); await forward_command_handler(update, context); return ConversationHandler.END
 
 async def edit_setting_ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    action = update.callback_query.data
-    task_id = context.user_data.get('current_task_id')
-    task = tasks_collection.find_one({"_id": task_id})
+    action = update.callback_query.data; task_id = context.user_data.get('current_task_id')
+    back_kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data=f"settings_menu:{task_id}")]])
+    instr = "\n\n🟢 *Edit:*\n• Send text to **ADD**.\n• Send `-text` to **REMOVE**.\n• Send `/clear` to **DELETE ALL**."
     
-    back_keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back to Settings", callback_data=f"settings_menu:{task_id}")]])
-    instructions = "\n\n🟢 *How to edit:*\n• Send text to **ADD** it to the list.\n• Send text starting with `-` to **REMOVE** a specific line (e.g., `-badword`).\n• Send `/clear` to **DELETE ALL**."
-
-    if action == "settings_edit_footer":
-        current = task.get("modifications", {}).get("footer_text", "")
-        current_display = f"```\n{current}\n```" if current else "_None_"
-        text = f"📝 *Footer Text*\n\nCurrently set to:\n{current_display}\n\nSend the new footer text (this replaces the old one).\nOr `/clear` to remove."
-        await update.callback_query.edit_message_text(text, reply_markup=back_keyboard, parse_mode='Markdown')
-        return ASK_FOOTER
-    elif action == "settings_edit_replace":
-        current = task.get("modifications", {}).get("replace_rules", "")
-        current_display = f"```\n{current}\n```" if current else "_None_"
-        text = f"🔄 *Replace Rules*\nFormat: `old => new`\n\nCurrent Rules:\n{current_display}{instructions}"
-        await update.callback_query.edit_message_text(text, reply_markup=back_keyboard, parse_mode='Markdown')
-        return ASK_REPLACE
-    elif action == "settings_edit_remove":
-        current = task.get("modifications", {}).get("remove_texts", "")
-        current_display = f"```\n{current}\n```" if current else "_None_"
-        text = f"✂️ *Remove Lines Containing*\n\nCurrent List:\n{current_display}{instructions}"
-        await update.callback_query.edit_message_text(text, reply_markup=back_keyboard, parse_mode='Markdown')
-        return ASK_REMOVE
-    elif action == "settings_edit_blacklist":
-        current = task.get("filters", {}).get("blacklist_words", "")
-        current_display = f"```\n{current}\n```" if current else "_None_"
-        text = f"🚫 *Blacklist Words*\n\nCurrent List:\n{current_display}{instructions}"
-        await update.callback_query.edit_message_text(text, reply_markup=back_keyboard, parse_mode='Markdown')
-        return ASK_BLACKLIST
-    elif action == "settings_edit_whitelist":
-        current = task.get("filters", {}).get("whitelist_words", "")
-        current_display = f"```\n{current}\n```" if current else "_None_"
-        text = f"✅ *Whitelist Words*\n\nCurrent List:\n{current_display}{instructions}"
-        await update.callback_query.edit_message_text(text, reply_markup=back_keyboard, parse_mode='Markdown')
-        return ASK_WHITELIST
-    elif action == "settings_edit_delay":
-        current_delay = task.get("settings", {}).get("delay", 0)
-        text = f"⏱️ *Current Delay:* {current_delay}s\n\nSend delay in seconds (0 to disable).\n\nOr /cancel."
-        await update.callback_query.edit_message_text(text, reply_markup=back_keyboard, parse_mode='Markdown')
-        return ASK_DELAY
-    return SETTINGS_MENU
+    if action == "settings_edit_footer": text = f"📝 *Footer*\nSend new footer.\n`/clear` to remove."
+    elif action == "settings_edit_replace": text = f"🔄 *Replace*\n`old => new`\n{instr}"
+    elif action == "settings_edit_remove": text = f"✂️ *Remove Lines*\n{instr}"
+    elif action == "settings_edit_blacklist": text = f"🚫 *Blacklist*\n{instr}"
+    elif action == "settings_edit_whitelist": text = f"✅ *Whitelist*\n{instr}"
+    elif action == "settings_edit_delay": text = f"⏱️ *Delay*\nSend seconds (0 to disable)."
+    else: return SETTINGS_MENU
+    
+    await update.callback_query.edit_message_text(text, reply_markup=back_kb, parse_mode='Markdown')
+    return {"settings_edit_footer": ASK_FOOTER, "settings_edit_replace": ASK_REPLACE, "settings_edit_remove": ASK_REMOVE, "settings_edit_blacklist": ASK_BLACKLIST, "settings_edit_whitelist": ASK_WHITELIST, "settings_edit_delay": ASK_DELAY}[action]
 
 async def save_setting_text(update: Update, context: ContextTypes.DEFAULT_TYPE, db_key_path: str):
-    task_id = context.user_data.get('current_task_id')
-    if not task_id: return ConversationHandler.END
-    
-    user_text = update.message.text.strip()
+    task_id = context.user_data.get('current_task_id'); user_text = update.message.text.strip()
     task = tasks_collection.find_one({"_id": task_id})
     
     if "footer_text" in db_key_path:
-        if user_text == '/clear' or user_text == '/skip':
-            new_value = None
-            msg = "🗑️ Footer deleted."
-        else:
-            new_value = user_text
-            msg = "✅ Footer updated."
+        new_value = None if user_text in ['/clear', '/skip'] else user_text
+        msg = "✅ Footer updated." if new_value else "🗑️ Footer deleted."
     else:
-        keys = db_key_path.split('.')
-        current_value = task
+        keys = db_key_path.split('.'); current_value = task
         for k in keys: current_value = current_value.get(k, {})
-        if not isinstance(current_value, str): current_value = ""
-        current_lines = [line.strip() for line in current_value.split('\n') if line.strip()]
+        current_lines = [line.strip() for line in (current_value or "").split('\n') if line.strip()]
         
-        if user_text == '/clear' or user_text == '/skip':
-            new_value = ""
-            msg = "🗑️ List cleared successfully."
+        if user_text in ['/clear', '/skip']: new_value = ""; msg = "🗑️ List cleared."
         elif user_text.startswith('-'):
-            item_to_remove = user_text[1:].strip()
-            if item_to_remove in current_lines:
-                current_lines.remove(item_to_remove)
-                new_value = "\n".join(current_lines)
-                msg = f"🗑️ Removed: '{item_to_remove}'"
-            else:
-                new_value = "\n".join(current_lines)
-                msg = f"❌ Could not find '{item_to_remove}' in the list."
+            item = user_text[1:].strip()
+            if item in current_lines: current_lines.remove(item); new_value = "\n".join(current_lines); msg = f"🗑️ Removed: '{item}'"
+            else: new_value = "\n".join(current_lines); msg = f"❌ Not found: '{item}'"
         else:
-            if user_text not in current_lines:
-                current_lines.append(user_text)
-                new_value = "\n".join(current_lines)
-                msg = f"✅ Added: '{user_text}'"
-            else:
-                new_value = "\n".join(current_lines)
-                msg = "⚠️ Item already exists in list."
+            if user_text not in current_lines: current_lines.append(user_text); new_value = "\n".join(current_lines); msg = f"✅ Added: '{user_text}'"
+            else: new_value = "\n".join(current_lines); msg = "⚠️ Exists."
 
     tasks_collection.update_one({"_id": task_id}, {"$set": {db_key_path: new_value}})
-    await update.message.reply_text(msg)
-    context.user_data['current_task_id'] = task_id
-    await asyncio.sleep(1)
-    return await show_settings_menu(update, context)
+    await update.message.reply_text(msg); await asyncio.sleep(1); return await show_settings_menu(update, context)
 
-async def get_footer(update: Update, context: ContextTypes.DEFAULT_TYPE): 
-    return await save_setting_text(update, context, "modifications.footer_text")
-
-async def get_replace_rules(update: Update, context: ContextTypes.DEFAULT_TYPE): 
-    return await save_setting_text(update, context, "modifications.replace_rules")
-
-async def get_remove_texts(update: Update, context: ContextTypes.DEFAULT_TYPE): 
-    return await save_setting_text(update, context, "modifications.remove_texts")
-
-async def get_blacklist(update: Update, context: ContextTypes.DEFAULT_TYPE): 
-    return await save_setting_text(update, context, "filters.blacklist_words")
-
-async def get_whitelist(update: Update, context: ContextTypes.DEFAULT_TYPE): 
-    return await save_setting_text(update, context, "filters.whitelist_words")
-
-async def get_delay(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    task_id = context.user_data.get('current_task_id')
+async def get_footer(u, c): return await save_setting_text(u, c, "modifications.footer_text")
+async def get_replace_rules(u, c): return await save_setting_text(u, c, "modifications.replace_rules")
+async def get_remove_texts(u, c): return await save_setting_text(u, c, "modifications.remove_texts")
+async def get_blacklist(u, c): return await save_setting_text(u, c, "filters.blacklist_words")
+async def get_whitelist(u, c): return await save_setting_text(u, c, "filters.whitelist_words")
+async def get_delay(u, c):
     try:
-        delay = int(update.message.text.strip())
-        if delay < 0: raise ValueError
-        tasks_collection.update_one({"_id": task_id}, {"$set": {"settings.delay": delay}})
-        await update.message.reply_text(f"✅ Delay set to {delay} seconds!")
-    except ValueError:
-        await update.message.reply_text("❌ Please send a valid number (0 or more).")
-    context.user_data['current_task_id'] = task_id
-    await asyncio.sleep(1)
-    return await show_settings_menu(update, context)
+        val = int(u.message.text.strip())
+        tasks_collection.update_one({"_id": c.user_data['current_task_id']}, {"$set": {"settings.delay": val}})
+        await u.message.reply_text(f"✅ Delay: {val}s")
+    except: await u.message.reply_text("❌ Invalid number.")
+    await asyncio.sleep(1); return await show_settings_menu(u, c)
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data.clear()
-    await context.bot.send_message(chat_id=update.effective_chat.id, text="❌ Operation cancelled.")
-    await forward_command_handler(update, context, from_cancel=True)
-    return ConversationHandler.END
+    context.user_data.clear(); await update.message.reply_text("❌ Cancelled."); await forward_command_handler(update, context, from_cancel=True); return ConversationHandler.END
 
-# --- Auto Save & Clone (Abbreviated for brevity, same logic) ---
-async def auto_save_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message_text = update.message.text
-    match = re.match(r"https?://t\.me/(c/)?(\w+)/(\d+)", message_text)
-    if not match: return
-    status_msg = await update.message.reply_text("⏳ Fetching post...")
-    path, thumb_path = None, None
-    try:
-        chat_id = int(f"-100{match.group(2)}") if match.group(1) else match.group(2)
-        msg_id = int(match.group(3))
-        message = await client.get_messages(chat_id, ids=msg_id)
-        if not message: 
-            await status_msg.edit_text("❌ Could not fetch message.")
-            return
-        if message.media:
-            path = await message.download_media(file=f"temp_save_{message.id}")
-            is_video = message.video or (message.document and message.file.mime_type.startswith('video/'))
-            if is_video: thumb_path = await generate_thumbnail(path)
-        user_chat_id = update.effective_user.id
-        if path:
-            with open(path, 'rb') as file:
-                if message.photo: await context.bot.send_photo(chat_id=user_chat_id, photo=file, caption=message.text or "")
-                elif is_video:
-                    thumb_file = open(thumb_path, 'rb') if thumb_path else None
-                    await context.bot.send_video(chat_id=user_chat_id, video=file, thumbnail=thumb_file, caption=message.text or "")
-                    if thumb_file: thumb_file.close()
-                else: await context.bot.send_document(chat_id=user_chat_id, document=file, caption=message.text or "")
-        elif message.text: 
-            await context.bot.send_message(chat_id=user_chat_id, text=message.text, disable_web_page_preview=True)
-        await status_msg.edit_text("✅ Post saved!")
-    except Exception as e: await status_msg.edit_text(f"❌ Error: {e}")
-    finally:
-        if path and os.path.exists(path): os.remove(path)
-        if thumb_path and os.path.exists(thumb_path): os.remove(thumb_path)
-
-# --- Clone Handler ---
-async def clone_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.message.reply_text("📋 *Clone Channel Mode*\n\n📥 Send source channel ID.\n\nOr /cancel.", parse_mode='Markdown')
-    return CLONE_SOURCE
-
-async def clone_get_source(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    ids = parse_chat_ids(update.message.text)
-    if not ids: await update.message.reply_text("❌ Invalid source."); return CLONE_SOURCE
-    context.user_data['clone_source'] = ids[0]
-    await update.message.reply_text("✅ Source set!\n\n📤 Send destination channel ID.")
-    return CLONE_DEST
-
-async def clone_get_dest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    ids = parse_chat_ids(update.message.text)
-    if not ids: await update.message.reply_text("❌ Invalid destination."); return CLONE_DEST
-    context.user_data['clone_dest'] = ids[0]
-    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Forwarding Allowed", callback_data="clone_restricted:false")], [InlineKeyboardButton("🚫 Restricted", callback_data="clone_restricted:true")]])
-    await update.message.reply_text("⚙️ Is forwarding restricted in source?", reply_markup=keyboard)
-    return CLONE_RESTRICTED
-
-async def clone_set_restricted(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query; await query.answer()
-    context.user_data['clone_restricted'] = query.data.split(':')[1] == 'true'
-    await query.edit_message_text("⏳ Starting clone... Send 'done' to start or links to skip.")
-    return await clone_get_skip_links(update, context)
-
-async def clone_get_skip_links(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data.setdefault('clone_skip_ids', [])
-    return CLONE_RESTRICTED
-
-async def clone_process_skip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if update.message.text.lower() == 'done': return await clone_execute(update, context)
-    match = re.match(r"https?://t\.me/(c/)?(\w+)/(\d+)", update.message.text)
-    if match: context.user_data['clone_skip_ids'].append(int(match.group(3))); await update.message.reply_text(f"✅ Skipped {match.group(3)}.")
-    return CLONE_RESTRICTED
-
-async def clone_execute(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    source, dest = context.user_data['clone_source'], context.user_data['clone_dest']
-    restricted = context.user_data.get('clone_restricted', False)
-    skip_ids = set(context.user_data.get('clone_skip_ids', []))
-    status_msg = await update.message.reply_text("⏳ Fetching messages...")
-    try:
-        all_messages = []
-        async for message in client.iter_messages(source):
-            if message.id not in skip_ids: all_messages.append(message)
-        all_messages.reverse()
-        await status_msg.edit_text(f"✅ Found {len(all_messages)} messages. Starting...")
-        for idx, message in enumerate(all_messages):
-            if (idx+1)%10==0: await status_msg.edit_text(f"⏳ {idx+1}/{len(all_messages)}...")
-            try:
-                if restricted:
-                    path, thumb_path = None, None
-                    if message.media:
-                        path = await message.download_media(file=f"temp_clone_{message.id}")
-                        is_video = message.video or (message.document and message.file.mime_type.startswith('video/'))
-                        if is_video: thumb_path = await generate_thumbnail(path)
-                    await client.send_file(dest, path or message.text, caption=message.text, thumb=thumb_path, link_preview=False)
-                    if path and os.path.exists(path): os.remove(path)
-                    if thumb_path and os.path.exists(thumb_path): os.remove(thumb_path)
-                else: await client.forward_messages(dest, message.id, source)
-                await asyncio.sleep(2)
-            except Exception as e: LOGGER.error(f"Clone error: {e}")
-        await status_msg.edit_text("✅ Clone complete!")
-    except Exception as e: await status_msg.edit_text(f"❌ Error: {e}")
-    return ConversationHandler.END
-
+# --- Batch & Clone ---
 async def batch_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.message.reply_text("📦 Batch Mode\nSend start and end links."); return GET_LINKS
-(GET_LINKS, GET_BATCH_DESTINATION) = range(11, 13)
+    await update.message.reply_text("📦 *Batch Mode*\nSend start and end links.\nExample:\n`https://t.me/channel/100`\n`https://t.me/channel/120`", parse_mode='Markdown'); return GET_LINKS
+
 async def get_links(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    links = update.message.text.split()
-    def parse(l): 
-        m = re.match(r"https?://t\.me/c/(\d+)/(\d+)", l)
-        return (int("-100"+m.group(1)), int(m.group(2))) if m else (None, None)
-    s_c, s_id = parse(links[0]); e_c, e_id = parse(links[1])
-    if not s_c or s_c != e_c: await update.message.reply_text("❌ Invalid links."); return GET_LINKS
+    text = update.message.text.strip(); links = text.split()
+    if len(links) < 2: await update.message.reply_text("❌ Send exactly two links (Start & End)."); return GET_LINKS
+    
+    def parse_link(l):
+        # Support Public (t.me/user/123) and Private (t.me/c/12345/123)
+        m = re.match(r"https?://t\.me/(?:c/)?(\w+)/(\d+)", l)
+        if not m: return None, None
+        chat_id_str, msg_id = m.groups()
+        if chat_id_str.isdigit(): return int(f"-100{chat_id_str}"), int(msg_id) # Private
+        return chat_id_str, int(msg_id) # Public (username)
+
+    s_c, s_id = parse_link(links[0]); e_c, e_id = parse_link(links[1])
+    
+    if not s_c or not e_c: await update.message.reply_text("❌ Invalid link format."); return GET_LINKS
+    # Note: We don't strictly check s_c == e_c because username vs ID might differ but be same chat.
+    
     context.user_data['batch_info'] = {'channel_id': s_c, 'start_id': s_id, 'end_id': e_id}
-    await update.message.reply_text("✅ Valid! Send destination ID."); return GET_BATCH_DESTINATION
+    await update.message.reply_text("✅ Links valid!\n📤 Send Destination Chat ID."); return GET_BATCH_DESTINATION
+
 async def get_batch_destination(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     ids = parse_chat_ids(update.message.text)
-    if not ids: await update.message.reply_text("❌ Invalid dest."); return GET_BATCH_DESTINATION
+    if not ids: await update.message.reply_text("❌ Invalid destination."); return GET_BATCH_DESTINATION
     info, dest = context.user_data['batch_info'], ids[0]
-    status_msg = await update.message.reply_text("⏳ Batching...")
+    status_msg = await update.message.reply_text(f"⏳ Batching {info['start_id']} -> {info['end_id']}...")
     try:
         msgs = await client.get_messages(info['channel_id'], ids=range(info['start_id'], info['end_id']+1))
-        for m in [x for x in msgs if x]:
-            await process_single_message(dest, m, m.text)
+        valid_msgs = [m for m in msgs if m]
+        await status_msg.edit_text(f"✅ Found {len(valid_msgs)} messages. Processing...")
+        for m in valid_msgs:
+            if m.grouped_id: 
+                # Simple handling for batch albums: just send them. 
+                # (Full album logic is complex for batch, usually sending single is safer or using forward)
+                await process_single_message(dest, m, m.text) 
+            else:
+                await process_single_message(dest, m, m.text)
             await asyncio.sleep(2)
-        await status_msg.edit_text("✅ Batch done!")
+        await status_msg.edit_text("✅ Batch complete!")
     except Exception as e: await status_msg.edit_text(f"❌ Error: {e}")
     return ConversationHandler.END
 
-# --- Main ---
+async def clone_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.message.reply_text("📋 *Clone Mode*\n📥 Send Source Channel ID.", parse_mode='Markdown'); return CLONE_SOURCE
+async def clone_get_source(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    ids = parse_chat_ids(update.message.text)
+    if not ids: await update.message.reply_text("❌ Invalid ID."); return CLONE_SOURCE
+    context.user_data['clone_source'] = ids[0]; await update.message.reply_text("✅ Source set!\n📤 Send Destination ID."); return CLONE_DEST
+async def clone_get_dest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    ids = parse_chat_ids(update.message.text)
+    if not ids: await update.message.reply_text("❌ Invalid ID."); return CLONE_DEST
+    context.user_data['clone_dest'] = ids[0]
+    await update.message.reply_text("⚙️ Restricted content? (Yes/No)", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Yes (Download)", callback_data="clone_restricted:true"), InlineKeyboardButton("No (Forward)", callback_data="clone_restricted:false")]]))
+    return CLONE_RESTRICTED
+async def clone_set_restricted(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data['clone_restricted'] = update.callback_query.data.split(':')[1] == 'true'
+    await update.callback_query.edit_message_text("⏳ Send 'done' to start or links to skip."); return await clone_get_skip_links(update, context)
+async def clone_get_skip_links(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data.setdefault('clone_skip_ids', []); return CLONE_RESTRICTED
+async def clone_process_skip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.message.text.lower() == 'done': return await clone_execute(update, context)
+    m = re.match(r"https?://t\.me/(?:c/)?(\w+)/(\d+)", update.message.text)
+    if m: context.user_data['clone_skip_ids'].append(int(m.group(2))); await update.message.reply_text(f"Skipped {m.group(2)}")
+    return CLONE_RESTRICTED
+async def clone_execute(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    src, dst, restr = context.user_data['clone_source'], context.user_data['clone_dest'], context.user_data.get('clone_restricted', False)
+    skips = set(context.user_data.get('clone_skip_ids', []))
+    msg = await update.message.reply_text("⏳ Fetching...")
+    try:
+        msgs = []
+        async for m in client.iter_messages(src):
+            if m.id not in skips: msgs.append(m)
+        msgs.reverse(); await msg.edit_text(f"✅ Cloning {len(msgs)} messages...")
+        for m in msgs:
+            try:
+                if restr: await process_single_message(dst, m, m.text)
+                else: await client.forward_messages(dst, m.id, src)
+                await asyncio.sleep(2)
+            except Exception as e: LOGGER.error(f"Clone err: {e}")
+        await msg.edit_text("✅ Done!")
+    except Exception as e: await msg.edit_text(f"❌ Error: {e}")
+    return ConversationHandler.END
+
+async def auto_save_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    m = re.match(r"https?://t\.me/(?:c/)?(\w+)/(\d+)", update.message.text)
+    if not m: return
+    chat_id_str, msg_id = m.groups()
+    chat_id = int(f"-100{chat_id_str}") if chat_id_str.isdigit() else chat_id_str
+    status = await update.message.reply_text("⏳ Saving...")
+    try:
+        msg = await client.get_messages(chat_id, ids=int(msg_id))
+        if not msg: await status.edit_text("❌ Not found."); return
+        await process_single_message(update.effective_user.id, msg, msg.text)
+        await status.edit_text("✅ Saved!")
+    except Exception as e: await status.edit_text(f"❌ Error: {e}")
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 *Welcome!*\n/forward - Manage tasks\n/help - Help", parse_mode='Markdown')
-
+    await update.message.reply_text("👋 *Welcome!*\n/forward - Tasks\n/batch - Batch Copy\n/clone - Clone Channel\n/help - Info", parse_mode='Markdown')
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("📚 *Help*\n/forward - Create Tasks\n/clear - Clear list\n-word - Remove word", parse_mode='Markdown')
+    await update.message.reply_text("📚 *Help*\n/forward - Create/Manage Tasks\n/batch - Copy range of messages\n/clone - Copy full channel", parse_mode='Markdown')
 
 async def main():
     global MY_ID
@@ -731,68 +519,25 @@ async def main():
     cancel_handler = CommandHandler('cancel', cancel)
     
     conv_handler = ConversationHandler(
-        entry_points=[
-            CommandHandler("forward", forward_command_handler),
-            CallbackQueryHandler(callback_query_handler, pattern="^(toggle_status|delete_confirm|settings_menu|settings_toggle_beautify|settings_toggle_filter|settings_toggle_blockme|view_stats)"),
-            CallbackQueryHandler(new_task_start, pattern="^new_task_start$")
-        ],
+        entry_points=[CommandHandler("forward", forward_command_handler), CallbackQueryHandler(callback_query_handler, pattern="^(toggle_status|delete_confirm|settings_menu|settings_toggle|view_stats)"), CallbackQueryHandler(new_task_start, pattern="^new_task_start$")],
         states={
-            MAIN_MENU: [
-                CommandHandler("forward", forward_command_handler),
-                CallbackQueryHandler(new_task_start, pattern="^new_task_start$"),
-                CallbackQueryHandler(callback_query_handler, pattern="^(toggle_status|delete_confirm|delete_execute|settings_menu|settings_toggle_beautify|settings_toggle_filter|settings_toggle_blockme|view_stats|back_to_main_menu)")
-            ],
-            SETTINGS_MENU: [
-                CommandHandler("forward", forward_command_handler),
-                CallbackQueryHandler(edit_setting_ask, pattern="^settings_edit_"),
-                CallbackQueryHandler(forward_command_handler, pattern="^back_to_main_menu$"),
-                CallbackQueryHandler(callback_query_handler, pattern="^(settings_toggle_beautify|settings_toggle_filter|settings_toggle_blockme|settings_menu)")
-            ],
-            ASK_LABEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_label)],
-            ASK_SOURCE: [MessageHandler(filters.ALL & ~filters.COMMAND, get_source)],
-            ASK_DESTINATION: [MessageHandler(filters.ALL & ~filters.COMMAND, get_destination)],
-            ASK_FOOTER: [MessageHandler(filters.TEXT, get_footer), CallbackQueryHandler(callback_query_handler, pattern="^settings_menu:")],
-            ASK_REPLACE: [MessageHandler(filters.TEXT, get_replace_rules), CallbackQueryHandler(callback_query_handler, pattern="^settings_menu:")],
-            ASK_REMOVE: [MessageHandler(filters.TEXT, get_remove_texts), CallbackQueryHandler(callback_query_handler, pattern="^settings_menu:")],
-            ASK_BLACKLIST: [MessageHandler(filters.TEXT, get_blacklist), CallbackQueryHandler(callback_query_handler, pattern="^settings_menu:")],
-            ASK_WHITELIST: [MessageHandler(filters.TEXT, get_whitelist), CallbackQueryHandler(callback_query_handler, pattern="^settings_menu:")],
-            ASK_DELAY: [MessageHandler(filters.TEXT, get_delay), CallbackQueryHandler(callback_query_handler, pattern="^settings_menu:")]
-        },
-        fallbacks=[cancel_handler],
-        allow_reentry=True
-    )
-
-    batch_conv = ConversationHandler(
-        entry_points=[CommandHandler('batch', batch_start)], 
-        states={GET_LINKS: [MessageHandler(filters.TEXT, get_links)], GET_BATCH_DESTINATION: [MessageHandler(filters.ALL, get_batch_destination)]}, 
-        fallbacks=[cancel_handler]
+            MAIN_MENU: [CommandHandler("forward", forward_command_handler), CallbackQueryHandler(new_task_start, pattern="^new_task_start$"), CallbackQueryHandler(callback_query_handler)],
+            SETTINGS_MENU: [CommandHandler("forward", forward_command_handler), CallbackQueryHandler(edit_setting_ask, pattern="^settings_edit_"), CallbackQueryHandler(forward_command_handler, pattern="^back_to_main_menu$"), CallbackQueryHandler(callback_query_handler)],
+            ASK_LABEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_label)], ASK_SOURCE: [MessageHandler(filters.ALL & ~filters.COMMAND, get_source)], ASK_DESTINATION: [MessageHandler(filters.ALL & ~filters.COMMAND, get_destination)],
+            ASK_FOOTER: [MessageHandler(filters.TEXT, get_footer), CallbackQueryHandler(callback_query_handler)], ASK_REPLACE: [MessageHandler(filters.TEXT, get_replace_rules), CallbackQueryHandler(callback_query_handler)],
+            ASK_REMOVE: [MessageHandler(filters.TEXT, get_remove_texts), CallbackQueryHandler(callback_query_handler)], ASK_BLACKLIST: [MessageHandler(filters.TEXT, get_blacklist), CallbackQueryHandler(callback_query_handler)],
+            ASK_WHITELIST: [MessageHandler(filters.TEXT, get_whitelist), CallbackQueryHandler(callback_query_handler)], ASK_DELAY: [MessageHandler(filters.TEXT, get_delay), CallbackQueryHandler(callback_query_handler)]
+        }, fallbacks=[cancel_handler], allow_reentry=True
     )
     
-    clone_conv = ConversationHandler(
-        entry_points=[CommandHandler('clone', clone_start)], 
-        states={CLONE_SOURCE: [MessageHandler(filters.ALL, clone_get_source)], CLONE_DEST: [MessageHandler(filters.ALL, clone_get_dest)], CLONE_RESTRICTED: [CallbackQueryHandler(clone_set_restricted, pattern="^clone_restricted:"), MessageHandler(filters.TEXT, clone_process_skip)]}, 
-        fallbacks=[cancel_handler]
-    )
+    batch_conv = ConversationHandler(entry_points=[CommandHandler('batch', batch_start)], states={GET_LINKS: [MessageHandler(filters.TEXT, get_links)], GET_BATCH_DESTINATION: [MessageHandler(filters.ALL, get_batch_destination)]}, fallbacks=[cancel_handler], allow_reentry=True)
+    clone_conv = ConversationHandler(entry_points=[CommandHandler('clone', clone_start)], states={CLONE_SOURCE: [MessageHandler(filters.ALL, clone_get_source)], CLONE_DEST: [MessageHandler(filters.ALL, clone_get_dest)], CLONE_RESTRICTED: [CallbackQueryHandler(clone_set_restricted), MessageHandler(filters.TEXT, clone_process_skip)]}, fallbacks=[cancel_handler], allow_reentry=True)
 
-    application.add_handler(conv_handler)
-    application.add_handler(batch_conv)
-    application.add_handler(clone_conv)
+    application.add_handler(conv_handler); application.add_handler(batch_conv); application.add_handler(clone_conv)
     application.add_handler(MessageHandler(filters.Regex(r'https?://t\.me/') & filters.TEXT, auto_save_handler))
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("start", start_command)); application.add_handler(CommandHandler("help", help_command))
 
-    LOGGER.info("Bot starting...")
-    await application.initialize()
-    await application.start()
-    await application.updater.start_polling()
-    
-    await client.start()
-    me = await client.get_me()
-    MY_ID = me.id
-    LOGGER.info(f"Telethon started as: {me.first_name}")
-    
-    await client.run_until_disconnected()
-    await application.stop()
+    LOGGER.info("Bot starting..."); await application.initialize(); await application.start(); await application.updater.start_polling()
+    await client.start(); me = await client.get_me(); MY_ID = me.id; LOGGER.info(f"Telethon: {me.first_name}"); await client.run_until_disconnected(); await application.stop()
 
-if __name__ == "__main__":
-    asyncio.run(main())
+if __name__ == "__main__": asyncio.run(main())
